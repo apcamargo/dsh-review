@@ -1,0 +1,55 @@
+{
+  "name": "@apcamargo/dsh-review",
+  "version": "0.1.0",
+  "description": "Adds /review and /end-review code-review commands to DeepSeek Harness",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/commands.js",
+    "lib/git.js",
+    "lib/prompts.js",
+    "lib/state.js",
+    "lib/types/**/*.d.ts",
+    "cordis.patch.yml",
+    "package.json"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "code-review"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/apcamargo/dsh-review.git"
+  },
+  "scripts": {
+    "test": "node test/smoke.js && node test/integration.js && node test/e2e.js"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-commands": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.2"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

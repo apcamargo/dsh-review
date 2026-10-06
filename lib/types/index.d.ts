@@ -1,0 +1,40 @@
+/**
+ * Public type surface of `@apcamargo/dsh-review`.
+ *
+ * The runtime is plain ESM JavaScript; these declarations describe the plugin
+ * entry, command grammar, and state helpers for type-only consumers.
+ * @module @apcamargo/dsh-review
+ */
+import type { Context } from "@deepseek-ai/cordis";
+
+/** Cordis plugin name. */
+export declare const name = "review";
+/** Required services: the command registry, process execution, and durable plugin state. */
+export declare const inject: string[];
+/**
+ * Open the review state domain and register the `/review` and `/end-review`
+ * commands.
+ */
+export declare function apply(ctx: Context): Promise<void>;
+
+/** Resolved review target kinds. */
+export type ReviewTarget =
+	| { type: "uncommitted" }
+	| { type: "baseBranch"; branch: string; mergeBase?: string | undefined }
+	| { type: "commit"; sha: string; title?: string | undefined }
+	| { type: "pullRequest"; prNumber: number; baseBranch: string; title: string; mergeBase?: string | undefined; ref?: string | undefined }
+	| { type: "folder"; paths: string[] };
+
+/** One session's durable review state record. */
+export interface ReviewSessionRecord {
+	/** Whether a review session is currently active. */
+	active: boolean;
+	/** Review target kind. */
+	targetKind?: string | undefined;
+	/** Human-readable review target description. */
+	target?: string | undefined;
+	/** ISO timestamp when the review started. */
+	startedAt?: string | undefined;
+	/** Shared custom review instructions. */
+	customInstructions?: string | undefined;
+}

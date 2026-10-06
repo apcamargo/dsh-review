@@ -1,0 +1,4 @@
+node_modules/
+package-lock.json
+composed-profile.json
+*.log

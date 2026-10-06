@@ -1,0 +1,6 @@
+# Ready-made overlay to enable the review plugin on any base-backed profile:
+#   dsh --profile web --patch ./node_modules/@apcamargo/dsh-review/cordis.patch.yml
+# or copy the row into your profile's cordis.patch.yml.
+- insert:
+    - id: review
+      name: "@apcamargo/dsh-review"
