@@ -48,7 +48,7 @@ function makeTable() {
 
 /**
  * Toggleable simulation state: the repository probe, spawn failures, the
- * `git status` outcome, and the argv of every spawned command.
+ * `git status` outcome, a hung subprocess, and the argv of every spawned command.
  */
 const mockState = {
 	gitRepository: true,
@@ -61,6 +61,7 @@ const mockState = {
 	statusStdout: " M src/index.ts\n",
 	statusCode: 0,
 	statusLossy: false,
+	hang: null,
 	spawned: [],
 };
 
@@ -92,6 +93,21 @@ const GIT_RESPONSES = [
 const subprocess = {
 	spawn(spec) {
 		mockState.spawned.push(spec.argv);
+		// A hung child: `done` settles only when the caller's signal aborts, as the
+		// real seam does after its terminate escalation.
+		if (mockState.hang?.(spec.argv)) {
+			return {
+				done: new Promise((resolve) => {
+					spec.signal?.addEventListener("abort", () => resolve({ exitCode: null, signal: "SIGTERM" }), { once: true });
+				}),
+				collected: {
+					stdout: { readFrom: () => ({ text: "", nextOffset: 0, lossy: false }) },
+					stderr: { readFrom: () => ({ text: "", nextOffset: 0, lossy: false }) },
+				},
+				terminate: () => {},
+				waitForExit: async () => true,
+			};
+		}
 		// A missing executable: the real seam's `done` REJECTS with a plain
 		// ENOENT-shaped Error (never SubprocessExecutableNotFoundError); mirror
 		// that so the runCommand degradation path is exercised.
@@ -174,7 +190,7 @@ const AGENT = {
 };
 
 /** Invoke one registered command as the dispatching adapter would. */
-async function runCommand(commandName, rawInput) {
+async function runCommand(commandName, rawInput, signal = new AbortController().signal) {
 	const definition = registered.find((entry) => entry.name === commandName);
 	assert.ok(definition, `command ${commandName} registered`);
 	return definition.handler({
@@ -182,8 +198,17 @@ async function runCommand(commandName, rawInput) {
 		agent: AGENT,
 		rawInput,
 		attachments: [],
-		signal: new AbortController().signal,
+		signal,
 	});
+}
+
+/** Reject when `promise` has not settled within `ms`, so a hang fails the test instead of stalling it. */
+function settlesWithin(promise, ms, label) {
+	let timer;
+	const deadline = new Promise((_, reject) => {
+		timer = setTimeout(() => reject(new Error(`${label} did not settle within ${ms}ms`)), ms);
+	});
+	return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
 }
 
 async function main() {
@@ -537,6 +562,15 @@ async function main() {
 	await runCommand("end-review", "done");
 	mockState.spawnFailure = null;
 
+	// A command whose request was already cancelled queues nothing and starts no review.
+	const followupsBeforeCancel = AGENT.followups.length;
+	result = await runCommand("review", "folder src docs", AbortSignal.abort());
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /cancelled/i);
+	assert.equal(AGENT.followups.length, followupsBeforeCancel);
+	result = await runCommand("review", "status");
+	assert.match(result.text, /no review active/);
+
 	// Simulated restart: a fresh apply() over the same medium keeps state.
 	await runCommand("review", "uncommitted");
 	const restartCtx = makeCtx();
@@ -549,6 +583,47 @@ async function main() {
 	// Unregistration disposes the commands.
 	for (const { disposer } of effects) await disposer();
 	assert.equal(registered.length, 0);
+
+	// Unloading mid-command: the in-flight command is cancelled and settles
+	// before the review domain closes, so no handler writes to a closed domain.
+	{
+		const timeline = [];
+		const lifecycleRegistered = [];
+		const lifecycleDisposers = [];
+		const lifecycleCtx = {
+			commands: {
+				register(definition) {
+					lifecycleRegistered.push(definition);
+					return () => {};
+				},
+			},
+			subprocess,
+			storageDomain: {
+				async open(spec) {
+					return { name: spec.name, close: async () => void timeline.push("domain closed"), table: () => makeTable() };
+				},
+			},
+			effect(execute) {
+				for (const disposer of execute()) lifecycleDisposers.push(disposer);
+			},
+		};
+		await apply(lifecycleCtx);
+		const review = lifecycleRegistered.find((entry) => entry.name === "review");
+		mockState.hang = (argv) => argv[0] === "gh" && argv[1] === "--version";
+		const inFlight = review
+			.handler({ commandId: "lifecycle", agent: { ...AGENT, followups: [] }, rawInput: "pr 123", attachments: [], signal: new AbortController().signal })
+			.then((outcome) => {
+				timeline.push("command settled");
+				return outcome;
+			});
+		// Cordis starts disposers in reverse registration order, async ones concurrently.
+		await Promise.all([...lifecycleDisposers].reverse().map((disposer) => disposer()));
+		const outcome = await settlesWithin(inFlight, 1000, "in-flight command");
+		mockState.hang = null;
+		assert.equal(outcome.kind, "error");
+		assert.match(outcome.text, /cancelled/i);
+		assert.deepEqual(timeline, ["command settled", "domain closed"]);
+	}
 
 	console.log("smoke: all assertions passed");
 }

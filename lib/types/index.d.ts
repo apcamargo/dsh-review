@@ -20,7 +20,8 @@ export declare const name = "review";
 export declare const inject: string[];
 /**
  * Open the review state domain and register the `/review` and `/end-review`
- * commands.
+ * commands. Unloading cancels the commands still running, waits for them to
+ * settle, then closes the domain.
  */
 export declare function apply(ctx: Context): Promise<void>;
 
