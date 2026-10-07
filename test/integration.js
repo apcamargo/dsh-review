@@ -10,13 +10,24 @@ import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { runCommand, getMergeBase, getLocalBranches, hasUncommittedChanges, hasPendingChanges, getCurrentBranch, getDefaultBranch, isGitRepository } from "../lib/git.js";
+import { GitError, runCommand, getMergeBase, getLocalBranches, hasUncommittedChanges, hasPendingChanges, getCurrentBranch, getDefaultBranch, isGitRepository } from "../lib/git.js";
+
+/** Process environment with the spec's overrides applied; an `undefined` override removes the variable. */
+function childEnv(overrides = {}) {
+	const env = { ...process.env };
+	for (const [key, value] of Object.entries(overrides)) {
+		if (value === undefined) delete env[key];
+		else env[key] = value;
+	}
+	return env;
+}
 
 /** Real collect-mode implementation of the subprocess seam over child_process. */
 const subprocess = {
 	spawn(spec) {
 		const child = spawn(spec.argv[0], spec.argv.slice(1), {
 			cwd: spec.cwd,
+			env: childEnv(spec.env),
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		const stdoutChunks = [];
@@ -110,10 +121,22 @@ async function main() {
 		await writeFile(path.join(root, "README.md"), "# changed\n");
 		assert.equal(await hasPendingChanges(ctx, root, undefined), true);
 
-		// Real git reports a plain directory as outside a repository.
+		// A repository-redirecting variable inherited from the host process must not
+		// point git away from the repository that the working directory identifies.
+		process.env.GIT_DIR = path.join(root, "no-such-git-dir");
+		try {
+			assert.equal(await isGitRepository(ctx, root, undefined), true);
+			assert.equal(await getCurrentBranch(ctx, root, undefined), "feature");
+		} finally {
+			delete process.env.GIT_DIR;
+		}
+
+		// Real git reports a plain directory as outside a repository, and only that
+		// fatal exit means "no repository": every other command fails loudly there.
 		const plainDir = await mkdtemp(path.join(tmpdir(), "dsh-review-norepo-"));
 		try {
 			assert.equal(await isGitRepository(ctx, plainDir, undefined), false);
+			await assert.rejects(getLocalBranches(ctx, plainDir, undefined), (error) => error instanceof GitError && error.code === "FAILED");
 		} finally {
 			await rm(plainDir, { recursive: true, force: true });
 		}

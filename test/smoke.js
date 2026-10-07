@@ -46,23 +46,52 @@ function makeTable() {
 	};
 }
 
-/** Toggleable non-repository simulation for the `--git-dir` lookup. */
-const mockState = { gitRepository: true, spawnFailure: null, ghFailure: null, localBranches: "feature\nmain\n" };
+/**
+ * Toggleable simulation state: the repository probe, spawn failures, the
+ * `git status` outcome, and the argv of every spawned command.
+ */
+const mockState = {
+	gitRepository: true,
+	spawnFailure: null,
+	ghFailure: null,
+	prViewStdout: JSON.stringify({ baseRefName: "main", title: "Add feature", headRefName: "feature" }),
+	checkoutCode: 0,
+	checkoutStderr: "",
+	localBranches: "feature\nmain\n",
+	statusStdout: " M src/index.ts\n",
+	statusCode: 0,
+	statusLossy: false,
+	spawned: [],
+};
 
-/** Mock `git`/`gh` command responses keyed by argv prefix. */
+/** Mock `git`/`gh` command responses keyed by argv prefix; exit codes follow real git (128 = fatal). */
 const GIT_RESPONSES = [
-	{ match: (argv) => argv[1] === "rev-parse" && argv[2] === "--git-dir", stdout: () => (mockState.gitRepository ? ".git" : ""), code: () => (mockState.gitRepository ? 0 : 1) },
-	{ match: (argv) => argv[1] === "status" && argv[2] === "--porcelain", stdout: " M src/index.ts\n" },
+	{ match: (argv) => argv[1] === "rev-parse" && argv[2] === "--git-dir", stdout: () => (mockState.gitRepository ? ".git" : ""), code: () => (mockState.gitRepository ? 0 : 128) },
+	{ match: (argv) => argv[1] === "rev-parse", code: 128, stdout: "" },
+	{
+		match: (argv) => argv[1] === "status" && argv[2] === "--porcelain",
+		stdout: () => mockState.statusStdout,
+		code: () => mockState.statusCode,
+		lossy: () => mockState.statusLossy,
+	},
 	{ match: (argv) => argv[1] === "branch" && argv[2] === "--show-current", stdout: "feature" },
-	{ match: (argv) => argv[1] === "symbolic-ref", code: 1, stdout: "" },
+	{ match: (argv) => argv[1] === "symbolic-ref", code: 128, stdout: "" },
 	{ match: (argv) => argv[1] === "branch", stdout: () => mockState.localBranches },
 	{ match: (argv) => argv[1] === "merge-base", stdout: "abc123def" },
+	{ match: (argv) => argv[0] === "gh" && argv[1] === "pr" && argv[2] === "view", stdout: () => mockState.prViewStdout },
+	{
+		match: (argv) => argv[0] === "gh" && argv[1] === "pr" && argv[2] === "checkout",
+		stdout: "",
+		stderr: () => mockState.checkoutStderr,
+		code: () => mockState.checkoutCode,
+	},
 	{ match: (argv) => argv[0] === "gh", stdout: "gh version 2.0.0" },
 ];
 
 /** Subprocess seam mock serving the canned git responses. */
 const subprocess = {
 	spawn(spec) {
+		mockState.spawned.push(spec.argv);
 		// A missing executable: the real seam's `done` REJECTS with a plain
 		// ENOENT-shaped Error (never SubprocessExecutableNotFoundError); mirror
 		// that so the runCommand degradation path is exercised.
@@ -83,11 +112,13 @@ const subprocess = {
 		const response = GIT_RESPONSES.find((entry) => entry.match(spec.argv)) ?? { code: 1, stdout: "" };
 		const stdout = typeof response.stdout === "function" ? response.stdout() : response.stdout ?? "";
 		const code = typeof response.code === "function" ? response.code() : response.code ?? 0;
+		const stderr = response.stderr?.() ?? "";
+		const lossy = response.lossy?.() ?? false;
 		return {
 			done: Promise.resolve({ exitCode: code, signal: null }),
 			collected: {
-				stdout: { readFrom: () => ({ text: stdout, nextOffset: stdout.length, lossy: false }) },
-				stderr: { readFrom: () => ({ text: "", nextOffset: 0, lossy: false }) },
+				stdout: { readFrom: () => ({ text: stdout, nextOffset: stdout.length, lossy }) },
+				stderr: { readFrom: () => ({ text: stderr, nextOffset: stderr.length, lossy: false }) },
 			},
 			terminate: () => {},
 			waitForExit: async () => true,
@@ -203,6 +234,21 @@ async function main() {
 	assert.match(result.text, /saved: "focus on performance"/);
 	result = await runCommand("review", "--aggressive status");
 	assert.equal(result.kind, "success");
+	assert.match(result.text, /no review active/);
+
+	// A mode keyword missing its required argument answers with that mode's usage
+	// line, queues nothing, and starts no review.
+	for (const [input, usageLine] of [
+		["commit", "/review commit <sha> [<title>]"],
+		["pr", "/review pr <number|url>"],
+		["folder", "/review folder <paths...>"],
+	]) {
+		result = await runCommand("review", input);
+		assert.equal(result.kind, "error", `/review ${input} without an argument is a usage error`);
+		assert.ok(result.text.includes(usageLine), `/review ${input} usage names ${usageLine}`);
+	}
+	assert.equal(AGENT.followups.length, 0);
+	result = await runCommand("review", "status");
 	assert.match(result.text, /no review active/);
 
 	// Bare invocation defaults to an uncommitted-changes review.
@@ -401,13 +447,90 @@ async function main() {
 	assert.match(result.text, /cli\.github\.com/);
 	mockState.ghFailure = null;
 
-	// A missing `git` entirely: the git-dependent forms degrade to the friendly
-	// git-repository guidance instead of a raw spawn error, and the snapshot
-	// review keeps working.
+	// The PR review checks out a branch, so it fails closed when the working-tree
+	// check cannot be trusted. The healthy run is the control: the same setup
+	// proceeds to the checkout.
+	mockState.statusStdout = "";
+	mockState.spawned.length = 0;
+	result = await runCommand("review", "pr 123");
+	assert.equal(result.kind, "success");
+	assert.match(result.text, /PR #123/);
+	assert.ok(mockState.spawned.some((argv) => argv[0] === "gh" && argv[2] === "checkout"), "healthy run checks the PR out");
+	await runCommand("end-review", "done");
+	for (const [label, outcome] of [
+		["git status exits with a fatal error", { statusCode: 128 }],
+		["git status output is truncated", { statusLossy: true }],
+	]) {
+		Object.assign(mockState, outcome);
+		mockState.spawned.length = 0;
+		result = await runCommand("review", "pr 123");
+		assert.equal(result.kind, "error", label);
+		assert.match(result.text, /git status/, `${label}: the error names the failing command`);
+		assert.ok(!mockState.spawned.some((argv) => argv[0] === "gh" && argv[2] === "checkout"), `${label}: no checkout`);
+		mockState.statusCode = 0;
+		mockState.statusLossy = false;
+	}
+	mockState.statusStdout = " M src/index.ts\n";
+
+	// An invalid reference is rejected before any `gh` or `git` command runs, even
+	// with a dirty tree or a missing `gh`.
+	for (const ghFailure of [null, "spawn gh ENOENT"]) {
+		mockState.ghFailure = ghFailure;
+		mockState.spawned.length = 0;
+		result = await runCommand("review", "pr abc");
+		assert.equal(result.kind, "error");
+		assert.match(result.text, /Invalid PR reference/);
+		// Only the repository probe runs; no `gh` and no `git status`.
+		assert.ok(
+			mockState.spawned.every((argv) => argv[0] === "git" && argv[1] === "rev-parse"),
+			"an invalid reference runs no gh or status command",
+		);
+	}
+	mockState.ghFailure = null;
+
+	// Pending-changes checks ignore untracked files at the source.
+	mockState.statusStdout = "";
+	mockState.spawned.length = 0;
+	result = await runCommand("review", "pr 123");
+	assert.equal(result.kind, "success");
+	assert.ok(
+		mockState.spawned.some((argv) => argv[1] === "status" && argv.includes("--untracked-files=no")),
+		"status skips the untracked scan",
+	);
+	await runCommand("end-review", "done");
+
+	// A failing checkout keeps the tail of a noisy stderr, where the real cause is.
+	mockState.checkoutCode = 1;
+	mockState.checkoutStderr = `${"progress line\n".repeat(400)}fatal: cannot switch branch`;
+	result = await runCommand("review", "pr 123");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /Failed to checkout PR/);
+	assert.match(result.text, /fatal: cannot switch branch/);
+	mockState.checkoutCode = 0;
+	mockState.checkoutStderr = "";
+
+	// `gh pr view` output that is not the expected JSON fails with the command named and checks nothing out.
+	for (const [label, stdout] of [
+		["non-JSON output", "Update available!\n"],
+		["JSON without the PR fields", "{}"],
+	]) {
+		mockState.prViewStdout = stdout;
+		mockState.spawned.length = 0;
+		result = await runCommand("review", "pr 123");
+		assert.equal(result.kind, "error", label);
+		assert.match(result.text, /gh pr view/, `${label}: the error names the failing command`);
+		assert.ok(!mockState.spawned.some((argv) => argv[0] === "gh" && argv[2] === "checkout"), `${label}: no checkout`);
+	}
+	mockState.prViewStdout = JSON.stringify({ baseRefName: "main", title: "Add feature", headRefName: "feature" });
+	mockState.statusStdout = " M src/index.ts\n";
+
+	// A missing `git` entirely: the git-dependent forms say git cannot run (not
+	// that the directory is no repository), and the snapshot review keeps working.
 	mockState.spawnFailure = "spawn git ENOENT";
 	result = await runCommand("review", "uncommitted");
 	assert.equal(result.kind, "error");
-	assert.match(result.text, /Not a git repository/);
+	assert.match(result.text, /Cannot run git/);
+	assert.doesNotMatch(result.text, /Not a git repository/);
 	result = await runCommand("review", "folder src docs");
 	assert.equal(result.kind, "success");
 	await runCommand("end-review", "done");

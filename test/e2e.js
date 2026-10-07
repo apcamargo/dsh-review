@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { runCommand as runProcess } from "../lib/git.js";
@@ -228,6 +228,29 @@ async function main() {
 		} finally {
 			await rm(masterRoot, { recursive: true, force: true });
 			AGENT.session.header.cwd = root;
+		}
+
+		// An unreadable project guidelines file fails the review loudly instead of
+		// silently reviewing without the project's rules. (A root user can read any
+		// file, so the permission cannot be withheld from it.)
+		if (process.getuid?.() !== 0) {
+			const guidelinesRoot = await mkdtemp(path.join(tmpdir(), "dsh-review-guidelines-"));
+			try {
+				await mkdir(path.join(guidelinesRoot, ".agents"));
+				const guidelinesPath = path.join(guidelinesRoot, "REVIEW_GUIDELINES.md");
+				await writeFile(guidelinesPath, "Always check the error budget.\n");
+				await chmod(guidelinesPath, 0o000);
+				AGENT.session.header.cwd = guidelinesRoot;
+				const followupsBefore = AGENT.followups.length;
+				const result = await runCommand("review", "folder .");
+				assert.equal(result.kind, "error");
+				assert.match(result.text, /REVIEW_GUIDELINES\.md/);
+				assert.equal(AGENT.followups.length, followupsBefore);
+				assert.match((await runCommand("review", "status")).text, /no review active/);
+			} finally {
+				await rm(guidelinesRoot, { recursive: true, force: true });
+				AGENT.session.header.cwd = root;
+			}
 		}
 	} finally {
 		await rm(root, { recursive: true, force: true });
