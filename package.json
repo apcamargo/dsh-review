@@ -11,7 +11,8 @@
       "default": "./lib/index.js"
     },
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
   },
   "files": [
     "lib/index.js",
@@ -20,7 +21,9 @@
     "lib/prompts.js",
     "lib/state.js",
     "lib/types/**/*.d.ts",
+    "locale",
     "cordis.patch.yml",
+    "CHANGELOG.md",
     "package.json"
   ],
   "keywords": [
@@ -42,7 +45,9 @@
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.4",
     "@deepseek-ai/dsh-commands": "^0.2.0-rc.2",
-    "@deepseek-ai/dsh-llm": "^0.2.0-rc.2"
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-storage-domain": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-subprocess": "^0.2.0-rc.2"
   },
   "engines": {
     "node": ">=22"

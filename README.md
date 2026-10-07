@@ -73,6 +73,25 @@ Finishes the active review in this session.
 
 Findings show up as an ordinary turn, so you can talk to the reviewer while it works.
 
+### Failures
+
+Git and `gh` failures are reported, never treated as an empty result. A command that cannot start, is cancelled, times out, truncates its output, or exits with an unexpected code ends the command with an error naming it. A missing mode argument (`/review commit`, `/review pr`, `/review folder`) answers with that mode's usage line. Unloading the plugin cancels reviews that are still gathering context.
+
+## Model Experience
+
+**What the model sees.** `/review` queues one user turn: the review rubric, the mode-specific focus, and any stored instructions, `--extra` text, `--aggressive` appendix, and project `REVIEW_GUIDELINES.md`. The turn is attributed to the `apcamargo-dsh-review` source. `/end-review summarize` and `/end-review fix` each queue one more turn. Command results and `/review status` stay outside model history.
+
+**Token effect.** Each review adds the rubric (a few thousand tokens) plus the focus once. Nothing is added per later turn.
+
+**KV cache effect.** The review turns only append to the conversation. The system prompt and the tool catalog never change, so starting or ending a review does not invalidate the cached prefix.
+
+## Known limitations
+
+- There is no review mode. The active review is a flag kept by the plugin; the agent never reads it, and nothing restricts its tools. The rubric asks the reviewer not to write a fix, but only the prompt enforces that.
+- The state is stored per session id. A forked or resumed session starts with no active review. A review left active in a session that is no longer used stays active until `/end-review done`.
+- Records of deleted sessions are not cleaned up.
+- Review turns are queued as a follow-up, so a `/review` issued while the agent is busy runs after the current turn.
+
 ## Development
 
 ```bash

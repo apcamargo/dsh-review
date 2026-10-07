@@ -17,7 +17,7 @@ declare module "@deepseek-ai/dsh-llm" {
 /** Cordis plugin name. */
 export declare const name = "review";
 /** Required services: the command registry, process execution, and durable plugin state. */
-export declare const inject: string[];
+export declare const inject: readonly ["commands", "subprocess", "storageDomain"];
 /**
  * Open the review state domain and register the `/review` and `/end-review`
  * commands. Unloading cancels the commands still running, waits for them to
@@ -30,14 +30,15 @@ export type ReviewTarget =
 	| { type: "uncommitted" }
 	| { type: "baseBranch"; branch: string; mergeBase?: string | undefined }
 	| { type: "commit"; sha: string; title?: string | undefined }
-	| { type: "pullRequest"; prNumber: number; baseBranch: string; title: string; mergeBase?: string | undefined; ref?: string | undefined }
-	| { type: "folder"; paths: string[] };
+	| { type: "pullRequest"; prNumber: number; baseBranch: string; title: string; mergeBase?: string | undefined }
+	| { type: "folder"; paths: string[] }
+	| { type: "custom"; focus: string };
 
 /** One session's durable review state record. */
 export interface ReviewSessionRecord {
 	/** Whether a review session is currently active. */
 	active: boolean;
-	/** Review target kind. */
+	/** Review target kind: `uncommitted`, `baseBranch`, `commit`, `pullRequest`, `folder`, or `custom`. */
 	targetKind?: string | undefined;
 	/** Human-readable review target description. */
 	target?: string | undefined;
