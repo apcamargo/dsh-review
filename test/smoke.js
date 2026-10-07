@@ -257,7 +257,8 @@ async function main() {
 	assert.match(result.text, /Review started: current changes/);
 	assert.equal(AGENT.followups.length, 1);
 	const reviewMessage = AGENT.followups[0];
-	assert.deepEqual(reviewMessage.source, { kind: "user" });
+	// The harness has no shared plugin source kind: the turn names its producer.
+	assert.deepEqual(reviewMessage.source, { kind: "apcamargo-dsh-review" });
 	assert.ok(reviewMessage.content[0].text.startsWith(REVIEW_RUBRIC));
 	assert.ok(reviewMessage.content[0].text.includes("Review the current code changes"));
 

@@ -7,6 +7,13 @@
  */
 import type { Context } from "@deepseek-ai/cordis";
 
+declare module "@deepseek-ai/dsh-llm" {
+	interface MessageSourceMap {
+		/** The review turns this plugin queues; the harness has no shared plugin source kind. */
+		"apcamargo-dsh-review": { readonly kind: "apcamargo-dsh-review" };
+	}
+}
+
 /** Cordis plugin name. */
 export declare const name = "review";
 /** Required services: the command registry, process execution, and durable plugin state. */
