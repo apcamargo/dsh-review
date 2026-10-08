@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Renamed the review output section "Human Reviewer Callouts (Non-Blocking)" to "Side Effects & Breaking Changes (Non-Blocking)" and added the missing feature-flag and config-default items to the summary handoff, which now matches the review rubric's eight items.
 - `/review commit`, `/review pr` and `/review folder` without an argument now answer with a usage line. They used to fail with a `TypeError`.
 - Git and `gh` calls fail fast. Truncated output, signal exits and unexpected exit codes are errors, and `/review pr` no longer checks out a branch when `git status` cannot be read. A missing `git` is reported as such, not as "Not a git repository".
 - `/review pr` validates the reference before running `gh` or `git`, ignores untracked files when it checks for pending changes, and reports unexpected `gh pr view` output as an error. A failed checkout shows the end of the `gh` diagnostic, where the cause is.

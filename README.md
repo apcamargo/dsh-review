@@ -2,7 +2,7 @@
 
 A DeepSeek Harness plugin that adds a code review workflow to `/review` and `/end-review`.
 
-It reviews uncommitted changes, changes against a base branch, a single commit, a GitHub pull request (checked out locally through `gh`), or a folder as a snapshot. Findings get a priority from `[P0]` to `[P3]` and a confidence level, and non-blocking notes for the human reviewer are kept separate from the fix items.
+It reviews uncommitted changes, changes against a base branch, a single commit, a GitHub pull request (checked out locally through `gh`), or a folder as a snapshot. Findings get a priority from `[P0]` to `[P3]` and a confidence level, and non-blocking Side Effects & Breaking Changes are kept separate from the fix items.
 
 ## Install
 
