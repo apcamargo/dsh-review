@@ -21,9 +21,13 @@ export declare const inject: readonly ["commands", "subprocess", "storageDomain"
 /**
  * Open the review state domain and register the `/review` and `/end-review`
  * commands. Unloading cancels the commands still running, waits for them to
- * settle, then closes the domain.
+ * settle, then closes the domain. Only `config.deep` is read; the runtime
+ * exports `Config` for the harness's schema validation.
  */
-export declare function apply(ctx: Context): Promise<void>;
+export declare function apply(ctx: Context, config?: { deep?: DeepConfig | undefined } | undefined): Promise<void>;
+
+/** The plugin's config schema (schemastery), validated by cordis at start. */
+export declare const Config: unknown;
 
 /** Resolved review target kinds. */
 export type ReviewTarget =
@@ -33,6 +37,45 @@ export type ReviewTarget =
 	| { type: "pullRequest"; prNumber: number; baseBranch: string; title: string; mergeBase?: string | undefined }
 	| { type: "folder"; paths: string[] }
 	| { type: "custom"; focus: string };
+
+/** Deep-review settings; every field is deployment config under `deep`. */
+export interface DeepConfig {
+	/** The `ctx.subagents` provider the fleet runs on (default `spawn`). */
+	reviewerProvider?: string | undefined;
+	/** Agent options for the reviewers, over the orchestrator's. */
+	reviewerAgentOptions?: DeepAgentOptions | undefined;
+	/** Agent options for every verifier lane, over the orchestrator's. */
+	verifierAgentOptions?: DeepAgentOptions | undefined;
+	/** Reviewer lenses to run; `performance` is opt-in. */
+	lenses?: string[] | undefined;
+	/** Tools the workers may use; checked against the orchestrator's tools. */
+	reviewerTools?: string[] | undefined;
+	maxReviewers?: number | undefined;
+	shardThresholdLines?: number | undefined;
+	concurrency?: number | undefined;
+	verifierConcurrency?: number | undefined;
+	executingConcurrency?: number | undefined;
+	reviewerTimeoutMs?: number | undefined;
+	verifierTimeoutMs?: number | undefined;
+	callBudgetMs?: number | undefined;
+	maxFindingsPerReviewer?: number | undefined;
+	maxVerifications?: number | undefined;
+	maxVerifierRuns?: number | undefined;
+	minReviewerSuccess?: number | undefined;
+	verifierRetries?: number | undefined;
+	/** Per-lane settings keyed by lane id. */
+	lanes?: Record<string, { enabled?: boolean | undefined; chunkSize?: number | undefined; agentOptions?: DeepAgentOptions | undefined }> | undefined;
+	maxSteeringEntries?: number | undefined;
+	maxSteeringChars?: number | undefined;
+}
+
+/** One worker's provider/model route overrides. */
+export interface DeepAgentOptions {
+	provider?: string | undefined;
+	model?: string | undefined;
+	reasoningEffort?: string | undefined;
+	maxTokens?: number | undefined;
+}
 
 /** One session's durable review state record. */
 export interface ReviewSessionRecord {
@@ -46,4 +89,6 @@ export interface ReviewSessionRecord {
 	startedAt?: string | undefined;
 	/** Shared custom review instructions. */
 	customInstructions?: string | undefined;
+	/** Whether the active review is a `--deep` fleet review. */
+	deep?: boolean | undefined;
 }

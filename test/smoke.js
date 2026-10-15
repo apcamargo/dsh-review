@@ -10,7 +10,9 @@
 import assert from "node:assert/strict";
 import { apply, name, inject } from "../lib/index.js";
 import { REVIEW_DOMAIN_SPEC } from "../lib/state.js";
+import { renderReviewState, parseReviewArgs } from "../lib/commands.js";
 import { REVIEW_RUBRIC, AGGRESSIVE_PROMPT, REVIEW_SUMMARY_PROMPT, REVIEW_FIX_FINDINGS_PROMPT } from "../lib/prompts.js";
+import { injectable } from "./fixtures/cordis-mock.js";
 
 /** In-memory KV table mock validating records at the durable boundary. */
 function makeTable() {
@@ -167,16 +169,25 @@ const commands = {
 
 /** Effect collector mock running the generator body and keeping disposers. */
 const effects = [];
+
 function makeCtx() {
-	return {
+	return injectable({
 		commands,
 		subprocess,
 		storageDomain,
+		listeners: [],
+		on(event, listener) {
+			this.listeners.push({ event, listener });
+			return () => {
+				const index = this.listeners.indexOf(this.listeners.find((l) => l.event === event && l.listener === listener));
+				if (index >= 0) this.listeners.splice(index, 1);
+			};
+		},
 		effect(execute, label) {
 			const iterator = execute();
 			for (const disposer of iterator) effects.push({ label, disposer });
 		},
-	};
+	});
 }
 
 const SESSION_ID = "session-test-0001";
@@ -226,8 +237,111 @@ async function main() {
 		assert.ok(review.input?.hint.includes(subcommand), `hint advertises ${subcommand}`);
 	}
 
+	// --deep grammar: any position parses (a deep start answers the missing-fleet
+	// error here — the mock never runs the inject body — while a flag value error
+	// names the flag, so the parse is asserted either way).
+	let result;
+	for (const input of ["uncommitted --deep", "--deep uncommitted", "--deep=true uncommitted", "--deep --aggressive check the error handling"]) {
+		result = await runCommand("review", input);
+		assert.equal(result.kind, "error", `${input}: ${result.text}`);
+		assert.match(result.text, /tools and subagents/, `${input} parses as a deep start`);
+		await runCommand("end-review", "done");
+	}
+	result = await runCommand("review", "uncommitted --deep=false");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /takes no value/);
+	result = await runCommand("review", "--deep=maybe uncommitted");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /takes no value/);
+	// Symmetric with --deep: `--aggressive=false` is a typo, not silence — any
+	// value but the tolerated `=true` errors (smoke below asserts `=true`).
+	result = await runCommand("review", "uncommitted --aggressive=false");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /--aggressive flag takes no value/);
+	result = await runCommand("review", "--aggressive=maybe uncommitted");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /--aggressive flag takes no value/);
+	// A plugin flag directly after --extra is not the value: consuming it made
+	// `--extra --deep` run a regular review with the literal instruction.
+	result = await runCommand("review", "uncommitted --extra --deep");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /Missing value for --extra/);
+	result = await runCommand("review", "uncommitted --extra --aggressive");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /Missing value for --extra/);
+	// Every form the partition accepts is a plugin flag to the guard, not the
+	// value (`--deep=true`, `--aggressive=false`, `--extra=...`).
+	result = await runCommand("review", "uncommitted --extra --deep=true");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /Missing value for --extra/);
+	result = await runCommand("review", "uncommitted --extra --aggressive=false");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /Missing value for --extra/);
+	result = await runCommand("review", "uncommitted --extra --extra=foo");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /Missing value for --extra/);
+	// An explicitly-quoted literal is the escape hatch that stores the literal
+	// word, as the instructions path: control-vs-value is decided on the raw
+	// remainder after --extra (the guard sees the quote-stripped token, so
+	// `--extra "--deep"` stores the literal while the bare `--extra --deep` is
+	// still the control word the guard rejects — `--extra=--deep` already did).
+	assert.deepEqual(parseReviewArgs('uncommitted --extra "--deep"'), { target: { type: "uncommitted" }, extraInstruction: "--deep", aggressive: false, deep: false, timeoutSec: undefined });
+	assert.deepEqual(parseReviewArgs('uncommitted --extra "--deep=true"'), { target: { type: "uncommitted" }, extraInstruction: "--deep=true", aggressive: false, deep: false, timeoutSec: undefined });
+	assert.deepEqual(parseReviewArgs("--extra=--deep"), { target: { type: "uncommitted" }, extraInstruction: "--deep", aggressive: false, deep: false, timeoutSec: undefined });
+	assert.equal(parseReviewArgs("uncommitted --extra --deep").error, "Missing value for --extra");
+	assert.equal(parseReviewArgs("uncommitted --extra --aggressive=false").error, "Missing value for --extra");
+	// The hint advertises the flag.
+	assert.ok(review.input?.hint.includes("--deep"), "hint advertises --deep");
+
+	// --timeout grammar: the fleet-worker timeout is a per-run parameter. A deep
+	// start with the flag in any position parses (the missing-fleet error
+	// asserts the parse); the value conventions mirror --deep/--aggressive — a
+	// missing value, a non-integer, or a value above the seconds bound is a
+	// typo, not silence.
+	for (const input of ["uncommitted --deep --timeout 900", "--deep --timeout=900 uncommitted", "--timeout 900 uncommitted --deep"]) {
+		result = await runCommand("review", input);
+		assert.equal(result.kind, "error", `${input}: ${result.text}`);
+		assert.match(result.text, /tools and subagents/, `${input} parses as a deep start`);
+		await runCommand("end-review", "done");
+	}
+	result = await runCommand("review", "uncommitted --deep --timeout");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /Missing value for --timeout/);
+	// A plugin flag directly after --timeout is not the value: consuming it
+	// silently swallowed `--timeout --deep` into a regular review.
+	result = await runCommand("review", "uncommitted --deep --timeout --aggressive");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /Missing value for --timeout/);
+	for (const bad of ["--timeout=abc", "--timeout 0", "--timeout=-5", "--timeout=1.5", "--timeout 15m", "--timeout 999999999"]) {
+		result = await runCommand("review", `uncommitted --deep ${bad}`);
+		assert.equal(result.kind, "error", `--timeout ${bad}: ${result.text}`);
+		assert.match(result.text, /integer number of seconds/, `--timeout ${bad}: ${result.text}`);
+	}
+	// Every form the partition accepts is a plugin flag to the --extra guard.
+	result = await runCommand("review", "uncommitted --extra --timeout 900");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /Missing value for --extra/);
+	result = await runCommand("review", "uncommitted --extra --timeout=900");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /Missing value for --extra/);
+	// The flag is fleet-only: a regular review answers with the flag's error,
+	// while status drops flags silently (the existing convention — the parse
+	// partitions flags before subcommand matching).
+	result = await runCommand("review", "uncommitted --timeout 900");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /applies to --deep reviews/);
+	result = await runCommand("review", "--timeout 900 status");
+	assert.equal(result.kind, "success");
+	assert.match(result.text, /no review active/);
+	// Duplicates: last wins (the --extra convention).
+	assert.equal(parseReviewArgs("uncommitted --deep --timeout 900 --timeout 600").timeoutSec, 600);
+	assert.equal(parseReviewArgs("uncommitted --deep --timeout=900").timeoutSec, 900);
+	assert.equal(parseReviewArgs("uncommitted --timeout 900 --deep").timeoutSec, 900);
+	// The hint advertises the flag.
+	assert.ok(review.input?.hint.includes("--timeout"), "hint advertises --timeout");
+
 	// Status: no review active, no instructions.
-	let result = await runCommand("review", "status");
+	result = await runCommand("review", "status");
 	assert.equal(result.kind, "success");
 	assert.match(result.text, /no review active/);
 	assert.match(result.text, /\(none\)/);
@@ -590,7 +704,7 @@ async function main() {
 		const timeline = [];
 		const lifecycleRegistered = [];
 		const lifecycleDisposers = [];
-		const lifecycleCtx = {
+		const lifecycleCtx = injectable({
 			commands: {
 				register(definition) {
 					lifecycleRegistered.push(definition);
@@ -598,6 +712,11 @@ async function main() {
 				},
 			},
 			subprocess,
+			listeners: [],
+			on(event, listener) {
+				this.listeners.push({ event, listener });
+				return () => {};
+			},
 			storageDomain: {
 				async open(spec) {
 					return { name: spec.name, close: async () => void timeline.push("domain closed"), table: () => makeTable() };
@@ -606,7 +725,7 @@ async function main() {
 			effect(execute) {
 				for (const disposer of execute()) lifecycleDisposers.push(disposer);
 			},
-		};
+		});
 		await apply(lifecycleCtx);
 		const review = lifecycleRegistered.find((entry) => entry.name === "review");
 		mockState.hang = (argv) => argv[0] === "gh" && argv[1] === "--version";
@@ -624,6 +743,23 @@ async function main() {
 		assert.match(outcome.text, /cancelled/i);
 		assert.deepEqual(timeline, ["command settled", "domain closed"]);
 	}
+
+	// renderReviewState: a deep record with no in-memory run (the fleet cleared
+	// on restart) renders the gone pipeline, not an active review with no
+	// pipeline line; a live deep run renders the pipeline states; a regular
+	// record renders no pipeline line.
+	assert.match(
+		renderReviewState({ active: true, deep: true, target: "current changes" }, undefined),
+		/Pipeline: gone \(the in-memory fleet cleared on restart/,
+	);
+	assert.match(
+		renderReviewState(
+			{ active: true, deep: true, target: "current changes" },
+			{ scan: { state: "complete" }, verify: { state: "partial" }, rawFindings: new Map() },
+		),
+		/Pipeline: scan complete, verify partial/,
+	);
+	assert.ok(!renderReviewState({ active: true, deep: false, target: "x" }, undefined).includes("Pipeline:"));
 
 	console.log("smoke: all assertions passed");
 }

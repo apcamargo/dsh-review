@@ -7,47 +7,17 @@
  */
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { realSubprocess } from "./fixtures/real-subprocess.js";
+import { injectable } from "./fixtures/cordis-mock.js";
 import { runCommand as runProcess } from "../lib/git.js";
 import { apply } from "../lib/index.js";
 import { REVIEW_SUMMARY_PROMPT } from "../lib/prompts.js";
 
 /** Real collect-mode implementation of the subprocess seam over child_process. */
-const subprocess = {
-	spawn(spec) {
-		const child = spawn(spec.argv[0], spec.argv.slice(1), { cwd: spec.cwd, stdio: ["ignore", "pipe", "pipe"] });
-		const stdoutChunks = [];
-		const stderrChunks = [];
-		child.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
-		child.stderr.on("data", (chunk) => stderrChunks.push(chunk));
-		const done = new Promise((resolve, reject) => {
-			child.on("error", reject);
-			child.on("close", (exitCode, signal) => resolve({ exitCode, signal }));
-		});
-		return {
-			done,
-			collected: {
-				stdout: {
-					readFrom: () => {
-						const text = Buffer.concat(stdoutChunks).toString("utf8");
-						return { text, nextOffset: Buffer.byteLength(text), lossy: false };
-					},
-				},
-				stderr: {
-					readFrom: () => {
-						const text = Buffer.concat(stderrChunks).toString("utf8");
-						return { text, nextOffset: Buffer.byteLength(text), lossy: false };
-					},
-				},
-			},
-			terminate: () => child.kill(),
-			waitForExit: async () => true,
-		};
-	},
-};
+const subprocess = realSubprocess;
 
 /** In-memory KV table mock with durable-boundary validation. */
 function makeTable() {
@@ -91,14 +61,19 @@ const commands = {
 };
 
 const effects = [];
-const ctx = {
+const ctx = injectable({
 	commands,
 	subprocess,
 	storageDomain,
+	listeners: [],
+	on(event, listener) {
+		this.listeners.push({ event, listener });
+		return () => {};
+	},
 	effect(execute, label) {
 		for (const disposer of execute()) effects.push({ label, disposer });
 	},
-};
+});
 
 const AGENT = {
 	id: "session-e2e-0001",
