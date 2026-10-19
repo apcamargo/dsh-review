@@ -11,7 +11,7 @@ export const TARGETS = [
 	{ type: "commit", sha: "abc1234" },
 	{ type: "pullRequest", prNumber: 7, title: "Add feature", baseBranch: "main", mergeBase: "b".repeat(40) },
 	{ type: "pullRequest", prNumber: 7, title: "Add feature", baseBranch: "main" },
-	{ type: "folder", paths: ["src", "docs"] },
+	{ type: "path", paths: ["src", "docs"] },
 	{ type: "custom", focus: "check the error handling" },
 ];
 

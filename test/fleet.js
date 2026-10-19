@@ -446,7 +446,7 @@ async function runToolFn(toolRegistry, agent, toolName, args, signal = new Abort
 	const over = validateVerificationInput({ groups: [...many.keys()].map((id) => ({ primary: id })), dropped: [] }, many, settings, lanes, true);
 	assert.match(over.error, /exceed the maximum/);
 
-	// Provenance is diff-only: fewer verifier runs planned for folder targets.
+	// Provenance is diff-only: fewer verifier runs planned for path targets.
 	const withDiff = validateVerificationInput({ groups: [{ primary: "R1.1" }], dropped: [{ id: "R1.2", reason: "x" }] }, raw, settings, lanes, true);
 	const withoutDiff = validateVerificationInput({ groups: [{ primary: "R1.1" }], dropped: [{ id: "R1.2", reason: "x" }] }, raw, settings, lanes, false);
 	assert.ok(withoutDiff.plannedRuns < withDiff.plannedRuns);
@@ -1227,7 +1227,7 @@ async function runToolFn(toolRegistry, agent, toolName, args, signal = new Abort
 /** Generated or vendored paths: excluded entirely from the uncommitted and
  * diff listings (a lock-only branch change spends no sharding weight or
  * reviewer runs), the committed form of the same content agreeing with the
- * uncommitted form, and kept as 0-weight folder entries. */
+ * uncommitted form, and kept as 0-weight path-mode entries. */
 {
 	const root = await mkdtemp(path.join(tmpdir(), "dsh-review-fleet-generated-"));
 	try {
@@ -1273,11 +1273,11 @@ async function runToolFn(toolRegistry, agent, toolName, args, signal = new Abort
 		const roster = planRoster({ files: baseListing.files, available: true, lenses: [...DEFAULTS.lenses], settings: resolveDeepConfig({}) });
 		assert.equal(roster.length, 7);
 		assert.ok(roster.every((entry) => entry.shard === null), "a generated-only diff reviews as whole change");
-		// Folder targets keep generated paths as 0-weight entries.
-		const folderListing = await listChangedFiles({ subprocess }, root, { type: "folder", paths: ["."] }, undefined);
-		const byPath = new Map(folderListing.files.map((file) => [file.path, file.lines]));
-		assert.equal(byPath.get("package-lock.json"), 0, "the lock is a 0-weight folder entry");
-		assert.equal(byPath.get("dist/x.min.js"), 0, "dist is a 0-weight folder entry");
+		// Path targets keep generated paths as 0-weight entries.
+		const pathListing = await listChangedFiles({ subprocess }, root, { type: "path", paths: ["."] }, undefined);
+		const byPath = new Map(pathListing.files.map((file) => [file.path, file.lines]));
+		assert.equal(byPath.get("package-lock.json"), 0, "the lock is a 0-weight path-mode entry");
+		assert.equal(byPath.get("dist/x.min.js"), 0, "dist is a 0-weight path-mode entry");
 		assert.ok((byPath.get("src/a.js") ?? 0) > 0, "the real file keeps its weight");
 	} finally {
 		await rm(root, { recursive: true, force: true });
@@ -3014,7 +3014,7 @@ try {
 		};
 		const harness = await makeHarness({ cwd: repoRoot, id: "session-failwrite-0001", table: failingTable });
 		const { agent, commands, table } = harness;
-		const result = await runCommandFn(commands, agent, "review", "folder folderB");
+		const result = await runCommandFn(commands, agent, "review", "path folderB");
 		assert.equal(result.kind, "error");
 		assert.match(result.text, /simulated backend write failure/);
 		// The order fix: the model-visible rubric turn is queued only after the
@@ -3074,7 +3074,7 @@ try {
 		await runCommandFn(commands, agent, "end-review", "done");
 	}
 
-	/** An outside-git folder review walks only the requested paths. */
+	/** An outside-git path review walks only the requested paths. */
 	{
 		const root = await mkdtemp(path.join(tmpdir(), "dsh-review-folders-"));
 		try {
@@ -3087,7 +3087,7 @@ try {
 			if (process.getuid?.() !== 0) await chmod(path.join(root, "folderB", "secret"), 0o000);
 			const harness = await makeHarness({ cwd: root, id: "session-folders-0001" });
 			const { agent, commands, toolRegistry } = harness;
-			const start = await runCommandFn(commands, agent, "review", "folder folderB --deep");
+			const start = await runCommandFn(commands, agent, "review", "path folderB --deep");
 			assert.equal(start.kind, "success");
 			// The roster exposes the scope: one file (folderB/b.js), not the whole
 			// cwd's two — a whole-cwd walk would list the sibling directory the
@@ -3104,10 +3104,10 @@ try {
 			if (process.getuid?.() !== 0) await chmod(path.join(root, "folderB", "secret"), 0o755).catch(() => {});
 			await rm(root, { recursive: true, force: true });
 		}
-		console.log("folders: ok");
+		console.log("paths: ok");
 	}
 
-	/** An in-repo folder review lists untracked net-new files under the
+	/** An in-repo path review lists untracked net-new files under the
 	 * requested paths: the two deployments must agree, or the file-local
 	 * lenses never review them. */
 	{
@@ -3127,7 +3127,7 @@ try {
 			await writeFile(path.join(root, "src", "untracked.js"), "y");
 			const harness = await makeHarness({ cwd: root, id: "session-folder-untracked-0001" });
 			const { agent, commands, toolRegistry } = harness;
-			await runCommandFn(commands, agent, "review", "folder src --deep");
+			await runCommandFn(commands, agent, "review", "path src --deep");
 			const scan = await runToolFn(toolRegistry, agent, "deep_review_scan", {});
 			assert.ok(scan.reviewersTotal >= 1);
 			// Both files reach the roster: the whole-change scope names 2 files.
@@ -3135,10 +3135,10 @@ try {
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
-		console.log("folder untracked: ok");
+		console.log("path untracked: ok");
 	}
 
-	/** In-repo folder pathspecs normalize against cwd (worktree-internal
+	/** In-repo path-mode pathspecs normalize against cwd (worktree-internal
 	 * absolute and ../ paths, and the cwd itself), and a worktree-external
 	 * pathspec falls back to the requested-path walk with git's diagnostic in
 	 * the coverage note. An unmatched-but-valid relative pathspec names the
@@ -3165,7 +3165,7 @@ try {
 			{
 				const harness = await makeHarness({ cwd: root, id: "session-folder-dot-0001" });
 				const { agent, commands, toolRegistry } = harness;
-				const start = await runCommandFn(commands, agent, "review", "folder . --deep");
+				const start = await runCommandFn(commands, agent, "review", "path . --deep");
 				assert.equal(start.kind, "success");
 				const scan = await runToolFn(toolRegistry, agent, "deep_review_scan", {});
 				assert.ok(scan.reviewersTotal >= 1);
@@ -3179,7 +3179,7 @@ try {
 			{
 				const harness = await makeHarness({ cwd: path.join(root, "sub"), id: "session-folder-abs-0001" });
 				const { agent, commands, toolRegistry } = harness;
-				const start = await runCommandFn(commands, agent, "review", `folder ${path.join(root, "src")} --deep`);
+				const start = await runCommandFn(commands, agent, "review", `path ${path.join(root, "src")} --deep`);
 				assert.equal(start.kind, "success");
 				const scan = await runToolFn(toolRegistry, agent, "deep_review_scan", {});
 				assert.ok(scan.reviewersTotal >= 1);
@@ -3195,7 +3195,7 @@ try {
 				await writeFile(path.join(external, "outside.js"), "x");
 				const harness = await makeHarness({ cwd: root, id: "session-folder-fallback-0001" });
 				const { agent, commands, toolRegistry } = harness;
-				const start = await runCommandFn(commands, agent, "review", `folder ${external} --deep`);
+				const start = await runCommandFn(commands, agent, "review", `path ${external} --deep`);
 				assert.equal(start.kind, "success");
 				const scan = await runToolFn(toolRegistry, agent, "deep_review_scan", {});
 				assert.ok(scan.reviewersTotal >= 1);
@@ -3213,7 +3213,7 @@ try {
 			{
 				const harness = await makeHarness({ cwd: root, id: "session-folder-vacuous-0001" });
 				const { agent, commands, toolRegistry } = harness;
-				const start = await runCommandFn(commands, agent, "review", "folder typo-dir --deep");
+				const start = await runCommandFn(commands, agent, "review", "path typo-dir --deep");
 				assert.equal(start.kind, "success");
 				const scan = await runToolFn(toolRegistry, agent, "deep_review_scan", {});
 				assert.ok(scan.reviewersTotal >= 1);
@@ -3223,7 +3223,7 @@ try {
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
-		console.log("folder pathspec: ok");
+		console.log("path pathspec: ok");
 	}
 
 	/** Cancellation: the turn's signal aborts in-flight workers; a re-call finishes. */

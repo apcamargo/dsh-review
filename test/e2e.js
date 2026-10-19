@@ -163,22 +163,22 @@ async function main() {
 		assert.equal(result.kind, "success");
 		assert.ok(AGENT.followups[4].content[0].text.startsWith(REVIEW_SUMMARY_PROMPT));
 
-		// Outside a git repository: git-dependent modes fail loud, folder reviews work.
+		// Outside a git repository: git-dependent modes fail loud, path reviews work.
 		const plainDir = await mkdtemp(path.join(tmpdir(), "dsh-review-norepo-"));
 		try {
 			AGENT.session.header.cwd = plainDir;
 			result = await runCommand("review", "uncommitted");
 			assert.equal(result.kind, "error");
 			assert.match(result.text, /Not a git repository/);
-			assert.match(result.text, /\/review folder/);
-			result = await runCommand("review", "folder .");
+			assert.match(result.text, /\/review path/);
+			result = await runCommand("review", "path .");
 			assert.equal(result.kind, "success");
 			assert.match(result.text, /Review started: paths: \./);
 			assert.ok(AGENT.followups[5].content[0].text.includes("Review the code in the following paths: ."));
 			await runCommand("end-review", "done");
 
 			// Bare @path input (the composer file picker's text) promotes to the
-			// folder snapshot review with the marker stripped — outside a git
+			// path snapshot review with the marker stripped — outside a git
 			// repository, where the snapshot review is at home.
 			result = await runCommand("review", "@.");
 			assert.equal(result.kind, "success");
@@ -230,7 +230,7 @@ async function main() {
 				await chmod(guidelinesPath, 0o000);
 				AGENT.session.header.cwd = guidelinesRoot;
 				const followupsBefore = AGENT.followups.length;
-				const result = await runCommand("review", "folder .");
+				const result = await runCommand("review", "path .");
 				assert.equal(result.kind, "error");
 				assert.match(result.text, /REVIEW_GUIDELINES\.md/);
 				assert.equal(AGENT.followups.length, followupsBefore);

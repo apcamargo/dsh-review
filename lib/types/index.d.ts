@@ -35,7 +35,7 @@ export type ReviewTarget =
 	| { type: "baseBranch"; branch: string; mergeBase?: string | undefined }
 	| { type: "commit"; sha: string; title?: string | undefined }
 	| { type: "pullRequest"; prNumber: number; baseBranch: string; title: string; mergeBase?: string | undefined }
-	| { type: "folder"; paths: string[] }
+	| { type: "path"; paths: string[] }
 	| { type: "custom"; focus: string };
 
 /** Deep-review settings; every field is deployment config under `deep`. */
@@ -80,7 +80,7 @@ export interface DeepAgentOptions {
 export interface ReviewSessionRecord {
 	/** Whether a review session is currently active. */
 	active: boolean;
-	/** Review target kind: `uncommitted`, `baseBranch`, `commit`, `pullRequest`, `folder`, or `custom`. */
+	/** Review target kind: `uncommitted`, `baseBranch`, `commit`, `pullRequest`, `path`, or `custom`. */
 	targetKind?: string | undefined;
 	/** Human-readable review target description. */
 	target?: string | undefined;

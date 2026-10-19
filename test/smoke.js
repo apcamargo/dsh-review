@@ -246,7 +246,7 @@ async function main() {
 	assert.deepEqual(registered.map((entry) => entry.name).sort(), ["end-review", "review"]);
 	const review = registered.find((entry) => entry.name === "review");
 	assert.match(review.description, /Review code changes/);
-	for (const subcommand of ["uncommitted", "branch", "commit", "pr", "folder", "instructions", "status"]) {
+	for (const subcommand of ["uncommitted", "branch", "commit", "pr", "path", "instructions", "status"]) {
 		assert.ok(review.input?.hint.includes(subcommand), `hint advertises ${subcommand}`);
 	}
 
@@ -304,14 +304,16 @@ async function main() {
 	assert.equal(parseReviewArgs("uncommitted --extra --deep").error, "Missing value for --extra");
 	assert.equal(parseReviewArgs("uncommitted --extra --aggressive=false").error, "Missing value for --extra");
 	// @path references (the composer file picker's text) strip the marker and
-	// read as folder snapshot paths — with the keyword and, promoted, without
-	// it (files and directories alike). A quoted path keeps its whitespace
-	// (tokens are used directly, never re-split); mixed text keeps the
-	// custom-focus reading; a lone `@` carries no path.
-	assert.deepEqual(parseReviewArgs("folder @src"), { target: { type: "folder", paths: ["src"] }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
-	assert.deepEqual(parseReviewArgs("folder @src/ --deep"), { target: { type: "folder", paths: ["src/"] }, extraInstruction: undefined, aggressive: false, deep: true, timeoutSec: undefined, concurrency: undefined });
-	assert.deepEqual(parseReviewArgs("@lib/git.js @docs"), { target: { type: "folder", paths: ["lib/git.js", "docs"] }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
-	assert.deepEqual(parseReviewArgs('folder @"My Docs"'), { target: { type: "folder", paths: ["My Docs"] }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
+	// read as the path snapshot mode's targets — with the keyword and,
+	// promoted, without it (files and directories alike). A quoted path keeps
+	// its whitespace (tokens are used directly, never re-split); mixed text
+	// keeps the custom-focus reading; a lone `@` carries no path. The old
+	// `folder` keyword is gone (the 0.2.2 rename): it now reads as focus text.
+	assert.deepEqual(parseReviewArgs("path @src"), { target: { type: "path", paths: ["src"] }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
+	assert.deepEqual(parseReviewArgs("path @src/ --deep"), { target: { type: "path", paths: ["src/"] }, extraInstruction: undefined, aggressive: false, deep: true, timeoutSec: undefined, concurrency: undefined });
+	assert.deepEqual(parseReviewArgs("@lib/git.js @docs"), { target: { type: "path", paths: ["lib/git.js", "docs"] }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
+	assert.deepEqual(parseReviewArgs('path @"My Docs"'), { target: { type: "path", paths: ["My Docs"] }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
+	assert.deepEqual(parseReviewArgs("folder src docs"), { target: { type: "custom", focus: "folder src docs" }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
 	assert.deepEqual(parseReviewArgs("@src error handling"), { target: { type: "custom", focus: "@src error handling" }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
 	assert.deepEqual(parseReviewArgs("@"), { target: { type: "custom", focus: "@" }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
 
@@ -473,7 +475,7 @@ async function main() {
 	for (const [input, usageLine] of [
 		["commit", "/review commit <sha> [<title>]"],
 		["pr", "/review pr <number|url>"],
-		["folder", "/review folder <paths...>"],
+		["path", "/review path <paths...>"],
 	]) {
 		result = await runCommand("review", input);
 		assert.equal(result.kind, "error", `/review ${input} without an argument is a usage error`);
@@ -546,8 +548,8 @@ async function main() {
 	result = await runCommand("end-review", "done");
 	assert.equal(result.kind, "success");
 
-	// Folder review renders the snapshot prompt.
-	result = await runCommand("review", "folder src docs");
+	// Path review renders the snapshot prompt.
+	result = await runCommand("review", "path src docs");
 	assert.equal(result.kind, "success");
 	assert.ok(AGENT.followups[5].content[0].text.includes("Review the code in the following paths: src, docs"));
 	await runCommand("end-review", "done");
@@ -651,19 +653,19 @@ async function main() {
 	assert.match(result.text, /Usage: \/end-review/);
 
 	// Outside a git repository, the bare default and explicit git-dependent
-	// modes fail loud with the same folder-review guidance.
+	// modes fail loud with the same path-review guidance.
 	mockState.gitRepository = false;
 	result = await runCommand("review", "uncommitted");
 	assert.equal(result.kind, "error");
 	assert.match(result.text, /Not a git repository/);
-	assert.match(result.text, /\/review folder/);
+	assert.match(result.text, /\/review path/);
 	result = await runCommand("review", "");
 	assert.equal(result.kind, "error");
 	assert.match(result.text, /Not a git repository/);
-	assert.match(result.text, /\/review folder/);
-	// Folder and custom reviews keep working (their prompt content is pinned
+	assert.match(result.text, /\/review path/);
+	// Path and custom reviews keep working (their prompt content is pinned
 	// above; the behavioral point here is availability outside a repository).
-	result = await runCommand("review", "folder src docs");
+	result = await runCommand("review", "path src docs");
 	assert.equal(result.kind, "success");
 	await runCommand("end-review", "done");
 	result = await runCommand("review", "check the error budget");
@@ -764,14 +766,14 @@ async function main() {
 	assert.equal(result.kind, "error");
 	assert.match(result.text, /Cannot run git/);
 	assert.doesNotMatch(result.text, /Not a git repository/);
-	result = await runCommand("review", "folder src docs");
+	result = await runCommand("review", "path src docs");
 	assert.equal(result.kind, "success");
 	await runCommand("end-review", "done");
 	mockState.spawnFailure = null;
 
 	// A command whose request was already cancelled queues nothing and starts no review.
 	const followupsBeforeCancel = AGENT.followups.length;
-	result = await runCommand("review", "folder src docs", AbortSignal.abort());
+	result = await runCommand("review", "path src docs", AbortSignal.abort());
 	assert.equal(result.kind, "error");
 	assert.match(result.text, /cancelled/i);
 	assert.equal(AGENT.followups.length, followupsBeforeCancel);
@@ -787,11 +789,11 @@ async function main() {
 	assert.match(statusAfterRestart.text, /Status: active/);
 	await runCommand("end-review", "done");
 
-	// Staged file attachments join as full host paths. With the folder mode they
+	// Staged file attachments join as full host paths. With the path mode they
 	// merge ahead of the text paths (deduped by absolute resolution); with no
 	// mode named they become the snapshot target themselves; a git-diff mode
 	// refuses the combination, and an image block is refused outright.
-	result = await runCommand("review", "folder src", undefined, [
+	result = await runCommand("review", "path src", undefined, [
 		{ type: "file", attachment: { attachmentId: "a1", name: "git.js", bytes: 10 } },
 	]);
 	assert.equal(result.kind, "success");
