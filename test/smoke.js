@@ -298,9 +298,9 @@ async function main() {
 	// remainder after --extra (the guard sees the quote-stripped token, so
 	// `--extra "--deep"` stores the literal while the bare `--extra --deep` is
 	// still the control word the guard rejects — `--extra=--deep` already did).
-	assert.deepEqual(parseReviewArgs('uncommitted --extra "--deep"'), { target: { type: "uncommitted" }, extraInstruction: "--deep", aggressive: false, deep: false, timeoutSec: undefined });
-	assert.deepEqual(parseReviewArgs('uncommitted --extra "--deep=true"'), { target: { type: "uncommitted" }, extraInstruction: "--deep=true", aggressive: false, deep: false, timeoutSec: undefined });
-	assert.deepEqual(parseReviewArgs("--extra=--deep"), { target: { type: "uncommitted" }, extraInstruction: "--deep", aggressive: false, deep: false, timeoutSec: undefined });
+	assert.deepEqual(parseReviewArgs('uncommitted --extra "--deep"'), { target: { type: "uncommitted" }, extraInstruction: "--deep", aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
+	assert.deepEqual(parseReviewArgs('uncommitted --extra "--deep=true"'), { target: { type: "uncommitted" }, extraInstruction: "--deep=true", aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
+	assert.deepEqual(parseReviewArgs("--extra=--deep"), { target: { type: "uncommitted" }, extraInstruction: "--deep", aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
 	assert.equal(parseReviewArgs("uncommitted --extra --deep").error, "Missing value for --extra");
 	assert.equal(parseReviewArgs("uncommitted --extra --aggressive=false").error, "Missing value for --extra");
 	// @path references (the composer file picker's text) strip the marker and
@@ -308,12 +308,12 @@ async function main() {
 	// it (files and directories alike). A quoted path keeps its whitespace
 	// (tokens are used directly, never re-split); mixed text keeps the
 	// custom-focus reading; a lone `@` carries no path.
-	assert.deepEqual(parseReviewArgs("folder @src"), { target: { type: "folder", paths: ["src"] }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined });
-	assert.deepEqual(parseReviewArgs("folder @src/ --deep"), { target: { type: "folder", paths: ["src/"] }, extraInstruction: undefined, aggressive: false, deep: true, timeoutSec: undefined });
-	assert.deepEqual(parseReviewArgs("@lib/git.js @docs"), { target: { type: "folder", paths: ["lib/git.js", "docs"] }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined });
-	assert.deepEqual(parseReviewArgs('folder @"My Docs"'), { target: { type: "folder", paths: ["My Docs"] }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined });
-	assert.deepEqual(parseReviewArgs("@src error handling"), { target: { type: "custom", focus: "@src error handling" }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined });
-	assert.deepEqual(parseReviewArgs("@"), { target: { type: "custom", focus: "@" }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined });
+	assert.deepEqual(parseReviewArgs("folder @src"), { target: { type: "folder", paths: ["src"] }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
+	assert.deepEqual(parseReviewArgs("folder @src/ --deep"), { target: { type: "folder", paths: ["src/"] }, extraInstruction: undefined, aggressive: false, deep: true, timeoutSec: undefined, concurrency: undefined });
+	assert.deepEqual(parseReviewArgs("@lib/git.js @docs"), { target: { type: "folder", paths: ["lib/git.js", "docs"] }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
+	assert.deepEqual(parseReviewArgs('folder @"My Docs"'), { target: { type: "folder", paths: ["My Docs"] }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
+	assert.deepEqual(parseReviewArgs("@src error handling"), { target: { type: "custom", focus: "@src error handling" }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
+	assert.deepEqual(parseReviewArgs("@"), { target: { type: "custom", focus: "@" }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined, concurrency: undefined });
 
 	// Attachment admission: a file block resolves to the stored copy's full host
 	// path through the attachments service (a receipt carries only the id, name,
@@ -384,6 +384,54 @@ async function main() {
 	assert.equal(parseReviewArgs("uncommitted --timeout 900 --deep").timeoutSec, 900);
 	// The hint advertises the flag.
 	assert.ok(review.input?.hint.includes("--timeout"), "hint advertises --timeout");
+
+	// --concurrency grammar: the fleet pool size is a per-run parameter, the
+	// --timeout conventions mirrored. A deep start with the flag in any
+	// position parses (the missing-fleet error asserts the parse); there is no
+	// static upper bound — the real bound is the harness's active-subagent
+	// capacity, read live and capped at review start (asserted in the fleet
+	// suite over a fake capacity).
+	for (const input of ["uncommitted --deep --concurrency 4", "--deep --concurrency=4 uncommitted", "--concurrency 4 uncommitted --deep"]) {
+		result = await runCommand("review", input);
+		assert.equal(result.kind, "error", `${input}: ${result.text}`);
+		assert.match(result.text, /tools and subagents/, `${input} parses as a deep start`);
+		await runCommand("end-review", "done");
+	}
+	result = await runCommand("review", "uncommitted --deep --concurrency");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /Missing value for --concurrency/);
+	// A plugin flag directly after --concurrency is not the value (the
+	// --timeout rule): consuming one silently swallowed `--concurrency --deep`.
+	result = await runCommand("review", "uncommitted --deep --concurrency --aggressive");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /Missing value for --concurrency/);
+	for (const bad of ["--concurrency=abc", "--concurrency 0", "--concurrency=-5", "--concurrency=1.5", "--concurrency 3w", "--concurrency 99999999999999999999"]) {
+		result = await runCommand("review", `uncommitted --deep ${bad}`);
+		assert.equal(result.kind, "error", `--concurrency ${bad}: ${result.text}`);
+		assert.match(result.text, /integer number of workers/, `--concurrency ${bad}: ${result.text}`);
+	}
+	// Every form the partition accepts is a plugin flag to the --extra guard.
+	result = await runCommand("review", "uncommitted --extra --concurrency 4");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /Missing value for --extra/);
+	result = await runCommand("review", "uncommitted --extra --concurrency=4");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /Missing value for --extra/);
+	// The flag is fleet-only: a regular review answers with the flag's error,
+	// while status drops flags silently (the existing convention — the parse
+	// partitions flags before subcommand matching).
+	result = await runCommand("review", "uncommitted --concurrency 4");
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /applies to --deep reviews/);
+	result = await runCommand("review", "--concurrency 4 status");
+	assert.equal(result.kind, "success");
+	assert.match(result.text, /no review active/);
+	// Duplicates: last wins (the --extra convention).
+	assert.equal(parseReviewArgs("uncommitted --deep --concurrency 4 --concurrency 6").concurrency, 6);
+	assert.equal(parseReviewArgs("uncommitted --deep --concurrency=4").concurrency, 4);
+	assert.equal(parseReviewArgs("uncommitted --concurrency 4 --deep").concurrency, 4);
+	// The hint advertises the flag.
+	assert.ok(review.input?.hint.includes("--concurrency"), "hint advertises --concurrency");
 
 	// Status: no review active, no instructions.
 	result = await runCommand("review", "status");

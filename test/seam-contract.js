@@ -8,13 +8,12 @@
  * `SubagentRuntime` and the REAL in-process spawn provider from the installed
  * harness packages and asserts the exact contract the fleet depends on: the
  * seam method names, the provider capability set, `inheritsParentContext`, and
- * the error ladder the fleet's fallbacks map to. A harness update that renames
- * any of this fails here, before a reviewer ever starts blank.
- *
- * What is deliberately out of scope: everything behind the activation manager
- * (receipt settlement, disposal cancellation, capacity) needs the agents
- * service and a live parent — that contract was verified against the harness
- * source and is exercised by the live smoke checklist in the migration notes.
+ * the error ladder the fleet's fallbacks map to. It also asserts the live
+ * activation-capacity read path the fleet's `--concurrency` cap depends on
+ * (`SubagentRuntime.config`'s volatile `maxActiveSubagents` reference): a
+ * TypeScript-private constructor property, so a harness rename would silently
+ * disable the cap. A harness update that renames any of this fails here,
+ * before a reviewer ever starts blank.
  *
  * @module @apcamargo/dsh-review/test/seam-contract
  */
@@ -57,8 +56,23 @@ assert.equal(typeof SubagentRuntime?.prototype?.getProvider, "function", "Subage
 // the canary never starts a child, so a stub satisfies the activation gate.
 const ctx = new Context();
 ctx.provide("workingDirectory", {});
-await ctx.plugin(SubagentRuntime, { maxDepth: 2, maxActiveSubagents: 8 });
+await ctx.plugin(SubagentRuntime, { maxDepth: 2, maxActiveSubagents: 6 });
 spawn.apply(ctx, { providerName: "spawn" });
+
+// --- The live capacity read the fleet's --concurrency cap depends on ---------
+// The fleet reads the harness's activation capacity off the service instance
+// (`config.maxActiveSubagents.get()` — TypeScript-private, runtime-present).
+// The mounted config below sets 6 — deliberately NOT the schema default 8 —
+// so the reference must answer the CONFIGURED value: a ref that ignored the
+// mount and answered the default would otherwise pass while the production
+// cap read the wrong number. A rename of the `config` property, the field,
+// or the volatile protocol disables the cap silently in production — fail
+// here instead.
+assert.equal(
+	ctx.subagents?.config?.maxActiveSubagents?.get?.(),
+	6,
+	"SubagentRuntime no longer exposes a readable live maxActiveSubagents reference — fleet/index.js's readHarnessActivationCapacity cannot cap --concurrency",
+);
 
 // The fleet's preflight contract against the REAL default provider
 // (`deep.reviewerProvider` default "spawn"): structured output must be

@@ -1,6 +1,6 @@
 {
   "name": "@apcamargo/dsh-review",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Adds /review and /end-review code-review commands to DeepSeek Harness",
   "type": "module",
   "main": "lib/index.js",

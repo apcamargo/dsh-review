@@ -52,7 +52,7 @@ export interface DeepConfig {
 	reviewerTools?: string[] | undefined;
 	maxReviewers?: number | undefined;
 	shardThresholdLines?: number | undefined;
-	/** Fleet workers running at once — the scan's reviewers and the verify phase's verifier lanes share this one pool size; at most 2 reproducer lanes run concurrently inside the verify pool. */
+	/** Fleet workers running at once — the scan's reviewers and the verify phase's verifier lanes share this one pool size; at most 2 reproducer lanes run concurrently inside the verify pool. At review start the effective value (this setting or the per-run `--concurrency` flag) is capped to the harness's live active-subagent capacity, read at that moment. */
 	concurrency?: number | undefined;
 	reviewerTimeoutMs?: number | undefined;
 	verifierTimeoutMs?: number | undefined;

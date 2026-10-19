@@ -252,7 +252,15 @@ async function makeHarness(options = {}) {
 		// The agents registry the fleet resolves workers through for its
 		// containment install; the provider registers each child on start.
 		ctx.provide("agents", { get: (id) => children.get(id) });
-		ctx.provide("subagents", { getProvider: (name_) => (name_ === "spawn" ? provider : undefined), startActivation: (spec) => provider.startActivation(spec) });
+		ctx.provide("subagents", {
+			getProvider: (name_) => (name_ === "spawn" ? provider : undefined),
+			startActivation: (spec) => provider.startActivation(spec),
+			// The live activation-capacity reference the fleet's begin reads to
+			// cap the pool size (on the real service a volatile schemastery ref
+			// under the TS-private `config`). Supplied only when the test sets
+			// `capacity`; its absence is the unreadable-shape case (no capping).
+			...(options.capacity !== undefined ? { config: { maxActiveSubagents: { get: () => options.capacity } } } : {}),
+		});
 	}
 	const steers = [];
 	const agent = {
@@ -2819,6 +2827,69 @@ try {
 		assert.match(scan.roster.find((entry) => entry.lens === "correctness").state, /failed \(reviewer timed out\)/);
 		// The in-call retry ran the worker exactly twice under the scaled budget.
 		assert.equal(started.filter((record) => record.label.startsWith("deep review: correctness")).length, 2);
+		await runCommandFn(commands, agent, "end-review", "done");
+	}
+
+	/** The per-run --concurrency flag over the config, and the begin-time
+	 * harness cap: a request past the harness's live active-subagent capacity
+	 * (read off the subagents service at begin, never a hardcoded number) is
+	 * capped to it and named in the start message — never silent. */
+	{
+		// Flag above capacity: capped, the message names the flag, the harness
+		// limit, and the effective value; the description hint keeps the request.
+		const harness = await makeHarness({ cwd: repoRoot, id: "session-concurrency-flag-0001", capacity: 8 });
+		const { agent, commands, toolRegistry } = harness;
+		const start = await runCommandFn(commands, agent, "review", "uncommitted --deep --concurrency 16");
+		assert.match(start.text, /⚠️ Requested fleet concurrency 16 \(--concurrency\) exceeds the harness's active-subagent limit \(8\); the fleet runs at most 8 workers at once/, `the cap is named: ${start.text}`);
+		const status = await runCommandFn(commands, agent, "review", "status");
+		assert.match(status.text, /\(workers 16\)/, "the requested value rides the description hint");
+		await runCommandFn(commands, agent, "end-review", "done");
+		// Flag at capacity: no cap, no notice.
+		const atCap = await makeHarness({ cwd: repoRoot, id: "session-concurrency-atcap-0001", capacity: 4 });
+		const atCapStart = await runCommandFn(atCap.commands, atCap.agent, "review", "uncommitted --deep --concurrency 4");
+		assert.doesNotMatch(atCapStart.text, /active-subagent limit/, "an at-capacity request is not capped");
+		await runCommandFn(atCap.commands, atCap.agent, "end-review", "done");
+		// Flag below capacity: no cap, no notice.
+		const belowCap = await makeHarness({ cwd: repoRoot, id: "session-concurrency-below-0001", capacity: 8 });
+		const belowStart = await runCommandFn(belowCap.commands, belowCap.agent, "review", "uncommitted --deep --concurrency 4");
+		assert.doesNotMatch(belowStart.text, /active-subagent limit/, "a below-capacity request is not capped");
+		await runCommandFn(belowCap.commands, belowCap.agent, "end-review", "done");
+		// Unreadable capacity (no config reference on the service): no cap, no
+		// notice — the pre-flag behavior, never a hardcoded fallback maximum.
+		const unreadable = await makeHarness({ cwd: repoRoot, id: "session-concurrency-unreadable-0001" });
+		const unreadableStart = await runCommandFn(unreadable.commands, unreadable.agent, "review", "uncommitted --deep --concurrency 16");
+		assert.doesNotMatch(unreadableStart.text, /active-subagent limit/, "an unreadable capacity skips the cap");
+		await runCommandFn(unreadable.commands, unreadable.agent, "end-review", "done");
+	}
+
+	/** The cap applies to the configured `deep.concurrency` too, and the capped
+	 * value reaches the pools: with capacity 2 and the default concurrency 3,
+	 * the scan and verify pools run at most 2 workers at once (measured at the
+	 * provider seam), and the notice names the config as the source. */
+	{
+		let concurrent = 0;
+		let maxConcurrent = 0;
+		const harness = await makeHarness({
+			cwd: repoRoot,
+			id: "session-concurrency-capped-pool-0001",
+			capacity: 2,
+			scripts: (label, request, started) => {
+				concurrent++;
+				maxConcurrent = Math.max(maxConcurrent, concurrent);
+				const outcome = defaultScripts({})(label, request, started);
+				return new Promise((resolve) => setTimeout(() => {
+					concurrent--;
+					resolve(outcome);
+				}, 50));
+			},
+		});
+		const { agent, commands, toolRegistry } = harness;
+		const start = await runCommandFn(commands, agent, "review", "uncommitted --deep");
+		assert.match(start.text, /⚠️ Requested fleet concurrency 3 \(deep\.concurrency\) exceeds the harness's active-subagent limit \(2\); the fleet runs at most 2 workers at once/, `the config-sourced cap is named: ${start.text}`);
+		await runToolFn(toolRegistry, agent, "deep_review_scan", {});
+		await runToolFn(toolRegistry, agent, "deep_review_verify", { groups: [{ primary: "R1.1" }], dropped: [{ id: "R2.1", reason: "style-only" }] });
+		assert.ok(maxConcurrent > 1, `the pool still runs in parallel: max ${maxConcurrent}`);
+		assert.ok(maxConcurrent <= 2, `the capped pool holds at most 2 workers: max ${maxConcurrent}`);
 		await runCommandFn(commands, agent, "end-review", "done");
 	}
 
