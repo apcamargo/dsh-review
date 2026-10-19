@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 import { apply, name, inject } from "../lib/index.js";
 import { REVIEW_DOMAIN_SPEC } from "../lib/state.js";
-import { renderReviewState, parseReviewArgs } from "../lib/commands.js";
+import { renderReviewState, parseReviewArgs, attachmentReviewPaths } from "../lib/commands.js";
 import { REVIEW_RUBRIC, AGGRESSIVE_PROMPT, REVIEW_SUMMARY_PROMPT, REVIEW_FIX_FINDINGS_PROMPT } from "../lib/prompts.js";
 import { injectable } from "./fixtures/cordis-mock.js";
 
@@ -175,6 +175,19 @@ function makeCtx() {
 		commands,
 		subprocess,
 		storageDomain,
+		// Cordis service access by key: the command handler reads the optional
+		// attachment store through ctx.get("attachments") exactly as the harness's
+		// own command runtime does, so the mock mirrors that seam.
+		get(name) {
+			return this[name];
+		},
+		attachments: {
+			// An upload transmits bytes and a display name, never the original
+			// location: the stored copy's host path is the attachment's full path.
+			fileHostPath(ref) {
+				return `/stored/${ref?.name ?? "unknown"}`;
+			},
+		},
 		listeners: [],
 		on(event, listener) {
 			this.listeners.push({ event, listener });
@@ -201,14 +214,14 @@ const AGENT = {
 };
 
 /** Invoke one registered command as the dispatching adapter would. */
-async function runCommand(commandName, rawInput, signal = new AbortController().signal) {
+async function runCommand(commandName, rawInput, signal = new AbortController().signal, attachments = []) {
 	const definition = registered.find((entry) => entry.name === commandName);
 	assert.ok(definition, `command ${commandName} registered`);
 	return definition.handler({
 		commandId: "test-command-id",
 		agent: AGENT,
 		rawInput,
-		attachments: [],
+		attachments,
 		signal,
 	});
 }
@@ -290,6 +303,38 @@ async function main() {
 	assert.deepEqual(parseReviewArgs("--extra=--deep"), { target: { type: "uncommitted" }, extraInstruction: "--deep", aggressive: false, deep: false, timeoutSec: undefined });
 	assert.equal(parseReviewArgs("uncommitted --extra --deep").error, "Missing value for --extra");
 	assert.equal(parseReviewArgs("uncommitted --extra --aggressive=false").error, "Missing value for --extra");
+	// @path references (the composer file picker's text) strip the marker and
+	// read as folder snapshot paths — with the keyword and, promoted, without
+	// it (files and directories alike). A quoted path keeps its whitespace
+	// (tokens are used directly, never re-split); mixed text keeps the
+	// custom-focus reading; a lone `@` carries no path.
+	assert.deepEqual(parseReviewArgs("folder @src"), { target: { type: "folder", paths: ["src"] }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined });
+	assert.deepEqual(parseReviewArgs("folder @src/ --deep"), { target: { type: "folder", paths: ["src/"] }, extraInstruction: undefined, aggressive: false, deep: true, timeoutSec: undefined });
+	assert.deepEqual(parseReviewArgs("@lib/git.js @docs"), { target: { type: "folder", paths: ["lib/git.js", "docs"] }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined });
+	assert.deepEqual(parseReviewArgs('folder @"My Docs"'), { target: { type: "folder", paths: ["My Docs"] }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined });
+	assert.deepEqual(parseReviewArgs("@src error handling"), { target: { type: "custom", focus: "@src error handling" }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined });
+	assert.deepEqual(parseReviewArgs("@"), { target: { type: "custom", focus: "@" }, extraInstruction: undefined, aggressive: false, deep: false, timeoutSec: undefined });
+
+	// Attachment admission: a file block resolves to the stored copy's full host
+	// path through the attachments service (a receipt carries only the id, name,
+	// and byte size — an upload never transmits the original location). Images
+	// and an absent store are rejected, an empty submission carries no paths.
+	{
+		const store = { fileHostPath: (ref) => `/stored/${ref.name}` };
+		const ctxWith = (service) => ({ get: (name) => (name === "attachments" ? service : undefined) });
+		assert.deepEqual(attachmentReviewPaths(ctxWith(store), []), []);
+		assert.deepEqual(attachmentReviewPaths(ctxWith(store), undefined), []);
+		assert.deepEqual(
+			attachmentReviewPaths(ctxWith(store), [{ type: "file", attachment: { attachmentId: "a1", name: "git.js", bytes: 10 } }]),
+			["/stored/git.js"],
+		);
+		assert.throws(() => attachmentReviewPaths(ctxWith(store), [{ type: "image", attachment: { id: "i1" } }]), /Image attachments cannot be reviewed as paths/);
+		assert.throws(() => attachmentReviewPaths(ctxWith(undefined), [{ type: "file", attachment: { name: "x" } }]), /no attachment store is composed/);
+		assert.throws(
+			() => attachmentReviewPaths(ctxWith({ fileHostPath: () => undefined }), [{ type: "file", attachment: { name: "x.js" } }]),
+			/The attached file "x\.js" could not be resolved to a path/,
+		);
+	}
 	// The hint advertises the flag.
 	assert.ok(review.input?.hint.includes("--deep"), "hint advertises --deep");
 
@@ -693,6 +738,32 @@ async function main() {
 	const statusAfterRestart = await runCommand("review", "status");
 	assert.match(statusAfterRestart.text, /Status: active/);
 	await runCommand("end-review", "done");
+
+	// Staged file attachments join as full host paths. With the folder mode they
+	// merge ahead of the text paths (deduped by absolute resolution); with no
+	// mode named they become the snapshot target themselves; a git-diff mode
+	// refuses the combination, and an image block is refused outright.
+	result = await runCommand("review", "folder src", undefined, [
+		{ type: "file", attachment: { attachmentId: "a1", name: "git.js", bytes: 10 } },
+	]);
+	assert.equal(result.kind, "success");
+	assert.ok(AGENT.followups.at(-1).content[0].text.includes("Review the code in the following paths: /stored/git.js, src"));
+	await runCommand("end-review", "done");
+	result = await runCommand("review", "", undefined, [
+		{ type: "file", attachment: { attachmentId: "a2", name: "prompts.js", bytes: 5 } },
+	]);
+	assert.equal(result.kind, "success");
+	assert.ok(AGENT.followups.at(-1).content[0].text.includes("Review the code in the following paths: /stored/prompts.js"));
+	assert.ok(AGENT.followups.at(-1).content[0].text.includes("This is a snapshot review (not a diff)"));
+	await runCommand("end-review", "done");
+	result = await runCommand("review", "uncommitted", undefined, [
+		{ type: "file", attachment: { attachmentId: "a3", name: "x.js", bytes: 5 } },
+	]);
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /Attached files review as a snapshot/);
+	result = await runCommand("review", "", undefined, [{ type: "image", attachment: { id: "i1" } }]);
+	assert.equal(result.kind, "error");
+	assert.match(result.text, /Image attachments cannot be reviewed as paths/);
 
 	// Unregistration disposes the commands.
 	for (const { disposer } of effects) await disposer();

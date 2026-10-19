@@ -123,6 +123,10 @@ async function main() {
 		assert.match(result.text, /Review started: current changes/);
 		assert.equal(AGENT.followups.length, 1);
 		assert.match(AGENT.followups[0].content[0].text, /Review the current code changes/);
+		// The simplification evaluation is always on: the prompt carries the
+		// principles and the required non-blocking section.
+		assert.match(AGENT.followups[0].content[0].text, /## Simplification opportunities \(non-blocking\)/);
+		assert.match(AGENT.followups[0].content[0].text, /Preserve functionality/);
 		await runCommand("end-review", "done");
 
 		// Branch review against main through REAL git.
@@ -169,8 +173,17 @@ async function main() {
 			assert.match(result.text, /\/review folder/);
 			result = await runCommand("review", "folder .");
 			assert.equal(result.kind, "success");
-			assert.match(result.text, /Review started: folders: \./);
+			assert.match(result.text, /Review started: paths: \./);
 			assert.ok(AGENT.followups[5].content[0].text.includes("Review the code in the following paths: ."));
+			await runCommand("end-review", "done");
+
+			// Bare @path input (the composer file picker's text) promotes to the
+			// folder snapshot review with the marker stripped — outside a git
+			// repository, where the snapshot review is at home.
+			result = await runCommand("review", "@.");
+			assert.equal(result.kind, "success");
+			assert.match(result.text, /Review started: paths: \./);
+			assert.ok(AGENT.followups[6].content[0].text.includes("Review the code in the following paths: ."));
 			await runCommand("end-review", "done");
 		} finally {
 			await rm(plainDir, { recursive: true, force: true });
@@ -195,11 +208,11 @@ async function main() {
 			result = await runCommand("review", "branch");
 			assert.equal(result.kind, "success");
 			assert.match(result.text, /Review started: changes against 'master'/);
-			assert.equal(AGENT.followups.length, 7);
+			assert.equal(AGENT.followups.length, 8);
 			// Bare `/end-review` (no mode) defaults to summarize.
 			result = await runCommand("end-review", "");
 			assert.equal(result.kind, "success");
-			assert.ok(AGENT.followups[7].content[0].text.startsWith(REVIEW_SUMMARY_PROMPT));
+			assert.ok(AGENT.followups[8].content[0].text.startsWith(REVIEW_SUMMARY_PROMPT));
 		} finally {
 			await rm(masterRoot, { recursive: true, force: true });
 			AGENT.session.header.cwd = root;

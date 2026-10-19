@@ -17,17 +17,19 @@ import { realSubprocess } from "./fixtures/real-subprocess.js";
 import { runCommand as runProcess } from "../lib/git.js";
 import { apply, inject, name } from "../lib/index.js";
 import { REVIEW_RUBRIC, RUBRIC_GUIDELINES, REVIEW_SUMMARY_PROMPT, buildDeepSummaryPrompt, buildDeepReviewPrompt } from "../lib/prompts.js";
-import { resolveDeepConfig, DEFAULTS, MAX_TIMER_MS } from "../lib/config.js";
-import { planRoster, balancedShards, rosterScope } from "../lib/fleet/roster.js";
-import { buildReviewerPrompt } from "../lib/fleet/prompts.js";
+import { resolveDeepConfig, DEFAULTS, MAX_TIMER_MS, LENS_IDS } from "../lib/config.js";
+import { planRoster, balancedShards, rosterScope, LOCAL_LENSES, CROSS_LENSES } from "../lib/fleet/roster.js";
+import { buildReviewerPrompt, buildVerifierPrompt, REVIEWER_PERSONA } from "../lib/fleet/prompts.js";
 import { planLaneRuns, projectForLane } from "../lib/fleet/blind.js";
-import { validateVerificationInput, overlapHints, buildAssessment } from "../lib/fleet/consolidate.js";
+import { validateVerificationInput, overlapHints, buildAssessment, groupsForLane } from "../lib/fleet/consolidate.js";
 import { moderate, moderateGroup, classify, renderFindings } from "../lib/fleet/aggregate.js";
 import { gateStance, checkEvidence, CITATION_SIZE_CAP } from "../lib/fleet/citations.js";
+import { missingReportedFindings } from "../lib/fleet/gate.js";
 import { createLedger } from "../lib/fleet/steering.js";
 import { applicableLanes } from "../lib/fleet/lanes.js";
-import { workerGuard, runAgent } from "../lib/fleet/agents.js";
+import { workerGuard, runAgent, mapPoolTotal, installWorkerContainment } from "../lib/fleet/agents.js";
 import { listChangedFiles, parseNumstat, treeDiff, walkFiles, snapshotTree } from "../lib/fleet/changes.js";
+import { simplificationAuditState } from "../lib/fleet/tools.js";
 import { verifierSchema, REVIEWER_SCHEMA, LANE_OUTCOMES } from "../lib/fleet/schemas.js";
 
 /** Real collect-mode subprocess seam over child_process, for the real git runs. */
@@ -75,52 +77,72 @@ function makeToolRegistry() {
 }
 
 /**
- * A fake subagent provider scripted per label. Reviewer labels answer with the
- * findings the test sets; verifier labels echo every `<report ref>` in their
- * prompt with the test's per-lane verdict.
+ * A fake subagent provider scripted per label, over the host's 0.2.1 seam:
+ * `startActivation({ provider, label, request, signal, delivery })` returning
+ * `{ childId, result, dispose }`. Reviewer labels answer with the findings the
+ * test sets; verifier labels echo every `<report ref>` in their prompt with
+ * the test's per-lane verdict. The provider advertises the real spawn
+ * capability set (no persona, no toolFilter — the fleet applies both itself),
+ * and each started child is registered in `children` so a fake `agents`
+ * service can resolve it the way the fleet's containment install does.
  */
 function makeProvider(options = {}) {
 	const started = [];
+	const children = new Map();
 	const provider = {
 		name: "spawn",
-		capabilities: { agentOptions: true, outputSchema: true, depthLimit: true, toolFilter: true, persona: true },
+		capabilities: { agentOptions: true, agentPreset: false, outputSchema: true, depthLimit: true },
 		inheritsParentContext: false,
 		guards: [],
-		async start(request) {
+		restrictions: [],
+		startActivation(spec) {
+			const request = spec.request;
 			const id = `child-${started.length + 1}`;
 			const record = {
 				id,
-				label: request.label,
+				label: spec.label,
 				prompt: request.prompt[0]?.text ?? "",
-				persona: request.persona,
 				outputSchema: request.outputSchema,
-				toolFilter: request.toolFilter,
 				agentOptions: request.agentOptions,
 				parent: request.parent,
 				disposed: false,
 			};
 			started.push(record);
+			// The in-process child the fleet resolves through the agents registry
+			// to install the tool restriction and the command guard. With
+			// `childTools: false` the child exposes no tools service, so every
+			// worker degrades — the containment-warning surface's live shape.
+			children.set(id, {
+				id,
+				...(options.childTools === false ? {} : {
+					ctx: {
+						tools: {
+							restrict(filter) { provider.restrictions.push({ id, filter }); },
+							guard(fn) { provider.guards.push({ id, fn }); },
+						},
+					},
+				}),
+			});
 			let outcome;
 			try {
-				outcome = options.scripts(request.label, request, started.length) ?? { stopReason: "completed", structured: { findings: [], sideEffects: [] } };
+				outcome = options.scripts(spec.label, request, started.length) ?? { stopReason: "completed", structured: { findings: [], sideEffects: [] } };
 			} catch (error) {
 				outcome = { stopReason: "error", diagnostic: error.message };
 			}
-			return {
-				id,
-				localAgent: { id, ctx: { tools: { guard(fn) { provider.guards.push({ id, fn }); } } } },
+			return Promise.resolve({
+				childId: id,
 				result: new Promise((resolve) => {
-					const delay = options.delay?.(request.label) ?? 0;
+					const delay = options.delay?.(spec.label) ?? 0;
 					if (delay) setTimeout(() => resolve(outcome), delay);
 					else resolve(outcome);
 				}),
 				async dispose() {
 					record.disposed = true;
 				},
-			};
+			});
 		},
 	};
-	return { provider, started };
+	return { provider, started, children };
 }
 
 /** The quoted line the temp repository's changed file contains. */
@@ -217,7 +239,7 @@ async function makeHarness(options = {}) {
 		reviewerTimeoutMs: options.deep?.reviewerTimeoutMs ?? 5000,
 		verifierTimeoutMs: options.deep?.verifierTimeoutMs ?? 5000,
 	});
-	const { provider, started } = makeProvider({ scripts: options.scripts ?? defaultScripts(options) });
+	const { provider, started, children } = makeProvider({ scripts: options.scripts ?? defaultScripts(options), childTools: options.childTools });
 	const toolRegistry = makeToolRegistry();
 	const commands = { registered: [], register(definition) { commands.registered.push(definition); return () => {}; } };
 	const table = options.table ?? makeTable();
@@ -227,7 +249,10 @@ async function makeHarness(options = {}) {
 	ctx.provide("commands", commands);
 	if (options.withFleet !== false) {
 		ctx.provide("tools", toolRegistry);
-		ctx.provide("subagents", { getProvider: (name_) => (name_ === "spawn" ? provider : undefined), start: (name_, request) => provider.start(request) });
+		// The agents registry the fleet resolves workers through for its
+		// containment install; the provider registers each child on start.
+		ctx.provide("agents", { get: (id) => children.get(id) });
+		ctx.provide("subagents", { getProvider: (name_) => (name_ === "spawn" ? provider : undefined), startActivation: (spec) => provider.startActivation(spec) });
 	}
 	const steers = [];
 	const agent = {
@@ -288,14 +313,19 @@ async function runToolFn(toolRegistry, agent, toolName, args, signal = new Abort
 {
 	const settings = resolveDeepConfig({});
 	const small = planRoster({ files: [{ path: "a.js", lines: 100 }], available: true, lenses: [...DEFAULTS.lenses], settings });
-	assert.equal(small.length, 6);
-	assert.deepEqual(small.map((entry) => entry.lens), ["correctness", "failure-paths", "security", "contracts", "consistency", "propagation"]);
+	assert.equal(small.length, 7);
+	// The simplification lens is a fourth file-local lens: it slots after
+	// security and before the cross-cutting lenses.
+	assert.deepEqual(small.map((entry) => entry.lens), ["correctness", "failure-paths", "security", "simplification", "contracts", "consistency", "propagation"]);
 	assert.ok(small.every((entry) => entry.shard === null));
 
 	const files = Array.from({ length: 40 }, (_, i) => ({ path: `f${i}.js`, lines: 400 }));
 	const large = planRoster({ files, available: true, lenses: [...DEFAULTS.lenses], settings });
 	const shards = large.find((entry) => entry.shard).shard.count;
-	assert.equal(large.length, 3 * shards + 3);
+	// maxReviewers 15 keeps three shards per local lens with the fourth lens
+	// present: bySlots = floor((15 - 3) / 4) = 3, roster = 4 * 3 + 3.
+	assert.equal(shards, 3);
+	assert.equal(large.length, 4 * shards + 3);
 	const balanced = balancedShards(files, shards);
 	const weights = balanced.map((shard) => shard.reduce((sum, file) => sum + file.lines, 0));
 	assert.ok(Math.max(...weights) - Math.min(...weights) <= 400, `shards balanced: ${weights.join(", ")}`);
@@ -306,7 +336,7 @@ async function runToolFn(toolRegistry, agent, toolName, args, signal = new Abort
 
 	// No listing: one shard for the whole change.
 	const custom = planRoster({ files: [], available: false, lenses: [...DEFAULTS.lenses], settings });
-	assert.equal(custom.length, 6);
+	assert.equal(custom.length, 7);
 	assert.match(rosterScope(custom[0]), /whole change/);
 
 	// A large diff with a tight reviewer cap shrinks the shard count.
@@ -337,6 +367,21 @@ async function runToolFn(toolRegistry, agent, toolName, args, signal = new Abort
 	assert.ok(empty.includes("(no file listing; follow the focus text)"), "the empty branch is unchanged");
 	assert.equal(rosterScope({ shard: null, files: bigFiles }), "whole change (500 files)", "rosterScope still names the full count");
 	console.log("file list cap: ok");
+}
+
+/** The worker output contract names the structured_output tool call — the
+ * seam's capture mechanism — and never asks for a text reply: a worker that
+ * "replies" with JSON in text ends its turn unstructured and its whole review
+ * is re-run (observed live: an 11-minute shard review discarded). */
+{
+	const prompt = buildReviewerPrompt({ entry: { id: "R1", lens: "correctness", shard: null, files: [] }, modePrompt: "focus", targetLabel: "label", promptOptions: {}, steering: null, aggressive: false });
+	assert.match(prompt, /`structured_output` tool exactly once/);
+	assert.doesNotMatch(prompt, /Reply with one JSON object/);
+	const lane = applicableLanes(resolveDeepConfig({ ...DEFAULTS }), true)[0];
+	const verifierPrompt = buildVerifierPrompt({ lane, reports: '<report ref="C1">claim</report>', targetDescription: "target", modeFocus: "focus", promptOptions: {}, steering: null, chunkIndex: 1, chunkCount: 1 });
+	assert.match(verifierPrompt, /`structured_output` tool exactly once/);
+	assert.doesNotMatch(verifierPrompt, /Reply with one JSON object/);
+	console.log("worker output contract: ok");
 }
 
 /** Overlap hints: same file, lines within 3 cluster; different files do not. */
@@ -449,14 +494,18 @@ async function runToolFn(toolRegistry, agent, toolName, args, signal = new Abort
 	assert.match(flawedNoRevision.fixNote, /fix needs design/);
 	assert.match(moderateGroup(assessment(), { reproducer, skeptic: skepticPos, "fix-auditor": "failed" }, true).fixNote, /unaudited/);
 
-	// The consistency lane's cited verdict is a note, never a decision.
+	// The consistency lane's cited verdict is a note, never a decision; the
+	// cited precedents render with it — one for a stated-convention citation,
+	// the recurrence list (capped) for an inferred one.
 	const consistencyNote = moderateGroup(assessment(), { reproducer, skeptic: skepticPos, consistency: { outcome: "inconsistent", notes: "", citationNote: "1/1 citations verified", evidence: [{ file: "p/b.js", line: 12, quote: "x" }] } }, true);
-	assert.match(consistencyNote.consistencyNote, /departs from the codebase pattern.*p\/b\.js:12/);
+	assert.match(consistencyNote.consistencyNote, /departs from a codebase convention \(precedent: `p\/b\.js:12`\)/);
+	const recurrenceNote = moderateGroup(assessment(), { reproducer, skeptic: skepticPos, consistency: { outcome: "consistent", notes: "", citationNote: "2/2 citations verified", evidence: [{ file: "p/b.js", line: 12, quote: "x" }, { file: "p/c.js", line: 3, quote: "y" }, { file: "p/d.js", line: 4, quote: "z" }, { file: "p/e.js", line: 5, quote: "w" }] } }, true);
+	assert.match(recurrenceNote.consistencyNote, /matches a codebase convention \(precedents: `p\/b\.js:12`, `p\/c\.js:3`, `p\/d\.js:4` \+1 more\)/);
 
 	// The final filter: default reports confirmed only; aggressive adds the unproven.
 	const contested = mod({ reproducer: reproNeg, skeptic: skepticPos });
 	const refuted = mod({ reproducer: reproNeg, skeptic: skepticNeg });
-	assert.deepEqual(classify([confirmed, contested, refuted], false), { reportable: [confirmed], withheld: [contested], dismissed: [refuted] });
+	assert.deepEqual(classify([confirmed, contested, refuted], false), { reportable: [confirmed], withheld: [contested], dismissed: [refuted], simplifications: [] });
 	const aggressive = classify([confirmed, contested, refuted], true);
 	assert.deepEqual(aggressive.reportable, [confirmed, contested]);
 	assert.deepEqual(aggressive.dismissed, [refuted]);
@@ -499,6 +548,246 @@ async function runToolFn(toolRegistry, agent, toolName, args, signal = new Abort
 	});
 	assert.deepEqual(emptyNotes.reasons, ["reproducer: not reproduced", "skeptic: unreachable"]);
 	console.log("moderator: ok");
+}
+
+/** The simplification pipeline: moderation table, kind routing, caps,
+ * rendering, and normalization guards. */
+{
+	const settings = resolveDeepConfig({});
+	const lanes = applicableLanes(settings, true);
+	// A simplification group's raw findings carry kind "simplification"; the
+	// suggestedFix IS the proposal (hasFixes true), the scenario is the
+	// behavior-preservation argument.
+	const simplRaw = new Map([["R4.1", {
+		id: "R4.1", kind: "simplification", lens: "simplification", file: "src/x.js", line: 7,
+		claim: "Collapse the two nested conditionals into a guard clause.",
+		scenario: "Both branches return early on the same condition; callers are traced and the else path is unreachable.",
+		suggestedFix: "Replace the nested if/else with a single early return.", priority: "P3",
+	}]]);
+	const simplAssessment = buildAssessment("V1", ["R4.1"], simplRaw);
+	assert.equal(simplAssessment.kind, "simplification");
+	assert.equal(simplAssessment.hasFixes, true);
+	const defectAssessment = buildAssessment("V2", ["R1.1"], new Map([["R1.1", { file: "a.js", line: 3, claim: "bug", scenario: "s", suggestedFix: "do this", priority: "P0" }]]));
+	assert.equal(defectAssessment.kind, "defect");
+
+	// groupsForLane: defect lanes never see simplification groups; the
+	// simplifier never sees defect groups; provenance filters by hasDiff only.
+	for (const laneId of ["reproducer", "skeptic", "consistency", "impact", "fix-auditor"]) {
+		const lane = lanes.find((entry) => entry.id === laneId);
+		assert.deepEqual(groupsForLane(lane, [simplAssessment, defectAssessment], true).map((group) => group.groupId), ["V2"], `${laneId} routes to defect groups only`);
+	}
+	const simplifier = lanes.find((entry) => entry.id === "simplifier");
+	assert.deepEqual(groupsForLane(simplifier, [simplAssessment, defectAssessment], true).map((group) => group.groupId), ["V1"]);
+	assert.deepEqual(groupsForLane(simplifier, [defectAssessment], true), [], "no simplification groups -> no simplifier runs");
+	const provenance = lanes.find((entry) => entry.id === "provenance");
+	assert.deepEqual(groupsForLane(provenance, [simplAssessment, defectAssessment], true).length, 2, "provenance filters both kinds");
+	assert.deepEqual(groupsForLane(provenance, [simplAssessment, defectAssessment], false), [], "provenance is diff-only");
+	assert.throws(() => groupsForLane({ id: "nonsense" }, [simplAssessment], true), /unknown verifier lane/);
+
+	// plannedRuns mirror === actual unit planning on a mixed consolidation.
+	const mixed = [defectAssessment, simplAssessment];
+	let mirror = 0;
+	for (const lane of lanes) {
+		const size = settings.lanes[lane.id]?.chunkSize ?? lane.chunkSize;
+		const count = groupsForLane(lane, mixed, true).length;
+		if (count > 0) mirror += Math.ceil(count / size);
+	}
+	assert.equal(mirror, 7, "1 defect group with a fix (6 lanes) + 1 simplification group (simplifier only)");
+
+	// The moderation table for simplification groups.
+	const simplModeration = (rows) => moderate({ assessments: [simplAssessment], hasDiff: true, laneResults: new Map([["V1", rows]]) })[0];
+	const citedSimplifier = { outcome: "simpler", notes: "traced both callers", citationNote: "1/1 citations verified", evidence: [{ file: "src/x.js", line: 7, quote: "if (a) { if (b) return 1; }" }] };
+	const confirmedSimpl = simplModeration({ simplifier: citedSimplifier });
+	assert.equal(confirmedSimpl.outcome, "confirmed");
+	assert.equal(confirmedSimpl.kind, "simplification");
+	assert.match(confirmedSimpl.strength, /single-lane audit: no behavior change found/);
+	assert.equal(confirmedSimpl.fix, "Replace the nested if/else with a single early return.");
+	assert.match(confirmedSimpl.fixNote, /audited by the simplifier lane/);
+	assert.doesNotMatch(confirmedSimpl.fixNote, /not audited/);
+	assert.deepEqual(confirmedSimpl.laneRows, ["simplifier: simpler (1/1 citations verified)", "provenance: not run"], "only the routed lanes render");
+	assert.equal(simplModeration({ simplifier: { ...citedSimplifier, outcome: "behavior-change" } }).outcome, "refuted");
+	assert.match(simplModeration({ simplifier: { ...citedSimplifier, outcome: "behavior-change" } }).reasons[0], /simplifier:/);
+	assert.equal(simplModeration({ simplifier: { ...citedSimplifier, outcome: "not-simpler" } }).outcome, "refuted");
+	assert.equal(simplModeration({ simplifier: { ...citedSimplifier, outcome: "unclear" } }).outcome, "inconclusive");
+	assert.equal(simplModeration({}).outcome, "unverified");
+	assert.equal(simplModeration({ simplifier: "failed" }).outcome, "unverified");
+	const dismissedSimpl = simplModeration({ simplifier: citedSimplifier, provenance: { outcome: "pre-existing", notes: "the nesting predates the change", citationNote: "1/1 citations verified", evidence: [{ file: "src/x.js", line: 7, quote: "if (a) { if (b) return 1; }" }] } });
+	assert.equal(dismissedSimpl.outcome, "refuted");
+	assert.match(dismissedSimpl.reasons[0], /pre-existing/);
+	const noDiffSimpl = moderate({ assessments: [simplAssessment], hasDiff: false, laneResults: new Map([["V1", { simplifier: citedSimplifier }]]) })[0];
+	assert.deepEqual(noDiffSimpl.laneRows, ["simplifier: simpler (1/1 citations verified)"], "no provenance row without a diff");
+	assert.equal(noDiffSimpl.outcome, "confirmed", "provenance dismissal cannot fire without the lane");
+
+	// The defect moderation path is unchanged: the simplifier row never leaks in.
+	const defectRows = { reproducer: { outcome: "reproduced", method: "executed", exercisedScenario: "ran", notes: "ran", evidence: [] }, skeptic: { outcome: "reachable", notes: "traced", citationNote: "1/1 citations verified", evidence: [] } };
+	const defectModerated = moderate({ assessments: [defectAssessment], hasDiff: true, laneResults: new Map([["V2", defectRows]]) })[0];
+	assert.ok(defectModerated.laneRows.every((row) => !row.startsWith("simplifier")), "defect findings carry no simplifier row");
+	assert.equal(defectModerated.laneRows.length, 6);
+
+	// classify routes kind-first: a confirmed simplification never lands in the
+	// defect findings, and an unverified one never lands in the defect
+	// suspicions (default or aggressive).
+	const confirmedFinding = { kind: "simplification", outcome: "confirmed", fix: "Replace the nested if/else with a single early return.", fixNote: "audited by the simplifier lane (1/1 citations verified)", claims: [{ file: "src/x.js", line: 7, claim: "collapse the conditionals" }], reviewerClaims: ["collapse the conditionals"], reasons: [], laneRows: [] };
+	const unverifiedFinding = { kind: "simplification", outcome: "unverified", claims: [{ file: "src/x.js", line: 9, claim: "inline the helper" }], reviewerClaims: ["inline the helper"], reasons: ["simplifier lane failed or did not assess this finding"], laneRows: [] };
+	const defectConfirmed = { kind: "defect", outcome: "confirmed", claims: [{ file: "a.js", line: 3, claim: "bug" }], reviewerClaims: ["bug"], reasons: [], laneRows: [] };
+	const defectContested = { ...defectConfirmed, outcome: "contested" };
+	const defaultSplit = classify([confirmedFinding, unverifiedFinding, defectConfirmed, defectContested], false);
+	assert.deepEqual(defaultSplit.reportable, [defectConfirmed]);
+	assert.deepEqual(defaultSplit.withheld, [defectContested], "unverified simplifications never enter the defect Withheld list");
+	assert.deepEqual(defaultSplit.simplifications, [confirmedFinding, unverifiedFinding]);
+	const aggressiveSplit = classify([confirmedFinding, unverifiedFinding, defectConfirmed, defectContested], true);
+	assert.deepEqual(aggressiveSplit.reportable, [defectConfirmed, defectContested], "unverified simplifications stay out of the defect reportable list even under --aggressive");
+	assert.deepEqual(aggressiveSplit.simplifications, [confirmedFinding, unverifiedFinding]);
+
+	// Rendering: the section always renders; items carry the title (fidelity
+	// probes it); the unaudited render as a count line by default and as
+	// labeled items under --aggressive; dismissed one-liners name the kind.
+	const findingTitle = confirmedFinding.claims[0].claim;
+	const renderedDefault = renderFindings({ ...defaultSplit, tree: { checked: false, changed: [] }, coverage: "7/7 reviewers", steering: null, dropped: [] });
+	assert.ok(renderedDefault.includes("## Simplification Opportunities (Non-Blocking)"));
+	assert.ok(renderedDefault.includes(findingTitle), "the confirmed item renders titleOf(finding)");
+	assert.ok(renderedDefault.includes(`${findingTitle}. Proposed:`), "a title without terminal punctuation keeps the sentence period");
+	// A title that already ends with terminal punctuation gains no second one
+	// (claims are reviewer text and commonly end with a period).
+	const periodClaim = "The helper wraps a single call site and adds indirection only.";
+	const renderedPeriod = renderFindings({ reportable: [], withheld: [], dismissed: [], simplifications: [{ ...confirmedFinding, claims: [{ file: "src/x.js", line: 7, claim: periodClaim }] }], tree: { checked: false, changed: [] }, coverage: "7/7 reviewers", steering: null, dropped: [] });
+	assert.ok(renderedPeriod.includes(`${periodClaim} Proposed:`), "a title's own period is not doubled");
+	assert.doesNotMatch(renderedPeriod, /\.\./);
+	assert.match(renderedDefault, /Proposed: Replace the nested/);
+	assert.match(renderedDefault, /1 raised simplification was not audited/);
+	assert.doesNotMatch(renderedDefault, /unaudited — do not apply/);
+	const renderedAggressive = renderFindings({ ...aggressiveSplit, aggressive: true, tree: { checked: false, changed: [] }, coverage: "7/7 reviewers", steering: null, dropped: [] });
+	assert.match(renderedAggressive, /unaudited — do not apply without verifying behavior with tests/);
+	const renderedNone = renderFindings({ reportable: [], withheld: [], dismissed: [], simplifications: [], tree: { checked: false, changed: [] }, coverage: "7/7 reviewers", steering: null, dropped: [] });
+	assert.match(renderedNone, /## Simplification Opportunities \(Non-Blocking\)\n[^\n]+\n- \(none\)/);
+	// A lens pinned out of deep.lenses must disclose that the audit did not
+	// happen, not print "- (none)" over a description that asserts it ran.
+	const renderedPinned = renderFindings({ reportable: [], withheld: [], dismissed: [], simplifications: [], simplificationAudit: { state: "not-configured" }, tree: { checked: false, changed: [] }, coverage: "7/7 reviewers", steering: null, dropped: [] });
+	assert.match(renderedPinned, /## Simplification Opportunities \(Non-Blocking\)/);
+	assert.doesNotMatch(renderedPinned, /- \(none\)/);
+	assert.match(renderedPinned, /- \(not evaluated — the simplification lens is not in deep\.lenses; add it to enable this audit\)/);
+	// An omitted simplifications bucket (no caller does this today) must still
+	// honor the always-rendered contract: it renders "- (none)", and the audit
+	// state alone decides the "(not evaluated …)" line.
+	const renderedOmitted = renderFindings({ reportable: [], withheld: [], dismissed: [], tree: { checked: false, changed: [] }, coverage: "7/7 reviewers", steering: null, dropped: [] });
+	assert.match(renderedOmitted, /## Simplification Opportunities \(Non-Blocking\)\n[^\n]+\n- \(none\)/);
+	const renderedOmittedPinned = renderFindings({ reportable: [], withheld: [], dismissed: [], simplificationAudit: { state: "not-configured" }, tree: { checked: false, changed: [] }, coverage: "7/7 reviewers", steering: null, dropped: [] });
+	assert.match(renderedOmittedPinned, /- \(not evaluated — the simplification lens is not in deep\.lenses; add it to enable this audit\)/);
+	const renderedDismissed = renderFindings({ reportable: [], withheld: [], dismissed: [{ kind: "simplification", outcome: "refuted", claims: [{ file: "src/x.js", line: 7, claim: "collapse the conditionals" }], reviewerClaims: [], reasons: ["pre-existing (1/1 citations verified)"], laneRows: [] }], simplifications: [], tree: { checked: false, changed: [] }, coverage: "7/7 reviewers", steering: null, dropped: [] });
+	assert.match(renderedDismissed, /collapse the conditionals \(simplification\) at `src\/x\.js:7`/);
+	// No render cap: every confirmed item renders, because the fidelity gate
+	// requires the orchestrator's verbatim copy to contain every confirmed
+	// title — a truncated section would manufacture a steer no copy can
+	// satisfy. (The flood bound is the consolidation kind cap.)
+	const twelve = Array.from({ length: 12 }, (_, i) => ({ kind: "simplification", outcome: "confirmed", claims: [{ file: `f${i}.js`, line: 1, claim: `simplify ${i}` }], reviewerClaims: [`simplify ${i}`], reasons: [], laneRows: [], fix: "do less" }));
+	const renderedCapped = renderFindings({ reportable: [], withheld: [], dismissed: [], simplifications: twelve, tree: { checked: false, changed: [] }, coverage: "7/7 reviewers", steering: null, dropped: [] });
+	assert.equal((renderedCapped.match(/simplify \d+/g) ?? []).length, 12, "every confirmed item renders");
+	assert.doesNotMatch(renderedCapped, /simplifications omitted/);
+	const fidelityOverTwelve = missingReportedFindings({ verify: { state: "complete", classified: { reportable: [], withheld: [], dismissed: [], simplifications: twelve } }, agent: { session: { deriveMessages: () => [{ role: "assistant", content: [{ type: "text", text: renderedCapped }] }] } } });
+	assert.deepEqual(fidelityOverTwelve, [], "a faithful verbatim copy of a 12-item section passes the fidelity gate");
+
+	// The runtime audit state (tools.js derives it from the scan roster) drives
+	// the section: "- (none)" only when the audit ran; every degraded state
+	// discloses itself, with items present or not; and the asserting intro
+	// renders only when it is provably true (audit ran, every item confirmed).
+	const assertIntro = (rendered, asserted) => assert.equal(rendered.includes("Behavior-preserving cleanups the simplifier lane audited."), asserted, `intro asserts the audit: ${asserted}`);
+	const auditedItem = { kind: "simplification", outcome: "confirmed", claims: [{ file: "src/x.js", line: 7, claim: "collapse the conditionals" }], reviewerClaims: ["collapse the conditionals"], reasons: [], laneRows: [], fix: "guard clause", strength: "single-lane audit: no behavior change found", fixNote: "audited by the simplifier lane" };
+	const renderedRanEmpty = renderFindings({ reportable: [], withheld: [], dismissed: [], simplifications: [], simplificationAudit: { state: "ran" }, tree: { checked: false, changed: [] }, coverage: "c", steering: null, dropped: [] });
+	assertIntro(renderedRanEmpty, false);
+	assert.match(renderedRanEmpty, /\n- \(none\)\n/);
+	const renderedRanItems = renderFindings({ reportable: [], withheld: [], dismissed: [], simplifications: [auditedItem], simplificationAudit: { state: "ran" }, tree: { checked: false, changed: [] }, coverage: "c", steering: null, dropped: [] });
+	assertIntro(renderedRanItems, true);
+	assert.doesNotMatch(renderedRanItems, /\(not evaluated/);
+	const renderedCutEmpty = renderFindings({ reportable: [], withheld: [], dismissed: [], simplifications: [], simplificationAudit: { state: "cut-by-cap" }, tree: { checked: false, changed: [] }, coverage: "c", steering: null, dropped: [] });
+	assert.match(renderedCutEmpty, /- \(not evaluated — the simplification lens was cut by the reviewer cap \(deep\.maxReviewers\); raise the cap to enable this audit\)/);
+	assertIntro(renderedCutEmpty, false);
+	const renderedFailedEmpty = renderFindings({ reportable: [], withheld: [], dismissed: [], simplifications: [], simplificationAudit: { state: "failed", ids: ["R4"] }, tree: { checked: false, changed: [] }, coverage: "c", steering: null, dropped: [] });
+	assert.match(renderedFailedEmpty, /- \(not evaluated — the simplification reviewer failed \(R4\); the audit did not run\. Re-run the review to retry it\)/);
+	assert.doesNotMatch(renderedFailedEmpty, /- \(none\)/);
+	const renderedFailedMulti = renderFindings({ reportable: [], withheld: [], dismissed: [], simplifications: [], simplificationAudit: { state: "failed", ids: ["R4", "R8"] }, tree: { checked: false, changed: [] }, coverage: "c", steering: null, dropped: [] });
+	assert.match(renderedFailedMulti, /the simplification reviewers failed \(R4, R8\)/);
+	// The mixed zero-succeeded roster: the pending reviewer is named by its
+	// real state, never blamed for a failure it did not have.
+	const renderedFailedMixed = renderFindings({ reportable: [], withheld: [], dismissed: [], simplifications: [], simplificationAudit: { state: "failed", ids: ["R4", "R8"], pendingIds: ["R8"] }, tree: { checked: false, changed: [] }, coverage: "c", steering: null, dropped: [] });
+	assert.match(renderedFailedMixed, /- \(not evaluated — the simplification reviewer failed \(R4\) and R8 was still pending when verification ran; the audit did not run\. Re-run the review to retry it\)/);
+	const renderedFailedMixedMulti = renderFindings({ reportable: [], withheld: [], dismissed: [], simplifications: [], simplificationAudit: { state: "failed", ids: ["R4", "R5", "R8", "R9"], pendingIds: ["R8", "R9"] }, tree: { checked: false, changed: [] }, coverage: "c", steering: null, dropped: [] });
+	assert.match(renderedFailedMixedMulti, /the simplification reviewers failed \(R4, R5\) and R8, R9 were still pending when verification ran/);
+	assert.doesNotMatch(renderedFailedMixedMulti, /failed \(R4, R5, R8/);
+	const renderedPendingMulti = renderFindings({ reportable: [], withheld: [], dismissed: [], simplifications: [], simplificationAudit: { state: "pending", ids: ["R4", "R8"] }, tree: { checked: false, changed: [] }, coverage: "c", steering: null, dropped: [] });
+	assert.match(renderedPendingMulti, /simplification reviewers R4, R8 were still pending/);
+	const renderedPartialWithItems = renderFindings({ reportable: [], withheld: [], dismissed: [], simplifications: [auditedItem, unverifiedFinding], simplificationAudit: { state: "partial", succeeded: 2, total: 3, ids: ["R8"] }, tree: { checked: false, changed: [] }, coverage: "c", steering: null, dropped: [] });
+	assert.match(renderedPartialWithItems, /- \(partially evaluated — 1 of 3 simplification reviewers did not succeed \(R8\); their scopes were not audited\. Re-run the review to retry it\)/);
+	assertIntro(renderedPartialWithItems, false);
+	// The count line pluralizes the pronoun with the item count.
+	const renderedTwoUnaudited = renderFindings({ reportable: [], withheld: [], dismissed: [], simplifications: [unverifiedFinding, { ...unverifiedFinding, claims: [{ file: "src/y.js", line: 2, claim: "inline the other helper" }], reviewerClaims: ["inline the other helper"] }], tree: { checked: false, changed: [] }, coverage: "c", steering: null, dropped: [] });
+	assert.match(renderedTwoUnaudited, /2 raised simplifications were not audited \(the simplifier lane failed, did not assess them, or was unclear\) and are omitted/);
+
+	// The audit-state derivation: runtime truth from the roster; the
+	// pinned-set config short-circuits before the roster is consulted.
+	assert.deepEqual(simplificationAuditState([{ id: "R1", lens: "correctness", state: "succeeded" }], { lenses: ["correctness"] }), { state: "not-configured" });
+	assert.deepEqual(simplificationAuditState([{ id: "R1", lens: "correctness", state: "succeeded" }, { id: "R2", lens: "failure-paths", state: "failed" }], settings), { state: "cut-by-cap" });
+	// planRoster really does slice the lens off at a tight cap, so the
+	// cut-by-cap state is reachable, not just constructible.
+	const tightRoster = planRoster({ files: [{ path: "a.js", lines: 100 }], available: true, lenses: [...DEFAULTS.lenses], settings: resolveDeepConfig({ maxReviewers: 3 }) });
+	assert.ok(!tightRoster.some((entry) => entry.lens === "simplification"), "maxReviewers 3 cuts the simplification lens");
+	assert.equal(simplificationAuditState(tightRoster, resolveDeepConfig({ maxReviewers: 3 })).state, "cut-by-cap");
+	assert.deepEqual(simplificationAuditState([{ id: "R4", lens: "simplification", state: "succeeded" }], settings), { state: "ran" });
+	assert.deepEqual(simplificationAuditState([{ id: "R4", lens: "simplification", state: "succeeded" }, { id: "R5", lens: "simplification", state: "pending" }], settings), { state: "partial", succeeded: 1, total: 2, ids: ["R5"] });
+	assert.deepEqual(simplificationAuditState([{ id: "R4", lens: "simplification", state: "failed" }], settings), { state: "failed", ids: ["R4"] });
+	assert.deepEqual(simplificationAuditState([{ id: "R4", lens: "simplification", state: "pending" }], settings), { state: "pending", ids: ["R4"] });
+	// The mixed zero-succeeded roster: the pending ids ride along separately so
+	// the disclosure can name each reviewer by its real state.
+	assert.deepEqual(
+		simplificationAuditState([{ id: "R4", lens: "simplification", state: "failed" }, { id: "R8", lens: "simplification", state: "pending" }], settings),
+		{ state: "failed", ids: ["R4", "R8"], pendingIds: ["R8"] },
+	);
+	// A pure-failed multi roster carries no pendingIds: every missed id failed.
+	assert.deepEqual(
+		simplificationAuditState([{ id: "R4", lens: "simplification", state: "failed" }, { id: "R8", lens: "simplification", state: "failed" }], settings),
+		{ state: "failed", ids: ["R4", "R8"] },
+	);
+	// A succeeded sibling keeps the partial state and the union ids semantics.
+	assert.deepEqual(
+		simplificationAuditState([{ id: "R4", lens: "simplification", state: "failed" }, { id: "R8", lens: "simplification", state: "pending" }, { id: "R9", lens: "simplification", state: "succeeded" }], settings),
+		{ state: "partial", succeeded: 1, total: 3, ids: ["R4", "R8"] },
+	);
+
+	// The mixed-kind rejection and the kind cap in validateVerificationInput.
+	const mixedRaw = new Map([
+		["R1.1", { id: "R1.1", kind: "defect", file: "a.js", line: 3, claim: "bug", scenario: "s", suggestedFix: "f", priority: "P0" }],
+		["R4.1", { id: "R4.1", kind: "simplification", file: "src/x.js", line: 7, claim: "collapse", scenario: "both branches return early", suggestedFix: "guard clause", priority: "P3" }],
+	]);
+	const mixedRejection = validateVerificationInput({ groups: [{ primary: "R1.1", mergedFrom: ["R4.1"] }], dropped: [] }, mixedRaw, settings, lanes, true);
+	assert.equal(mixedRejection.ok, false);
+	assert.match(mixedRejection.error, /never merge kinds.*R4\.1/);
+	const kindCapRaw = new Map(Array.from({ length: 11 }, (_, i) => [`R4.${i + 1}`, { id: `R4.${i + 1}`, kind: "simplification", file: `f${i}.js`, line: 1, claim: "s", scenario: "preserves behavior", priority: "P3" }]));
+	const kindCap = validateVerificationInput({ groups: [...kindCapRaw.keys()].map((id) => ({ primary: id })), dropped: [] }, kindCapRaw, settings, lanes, true);
+	assert.equal(kindCap.ok, false, "11 simplification groups exceed ceil(30/3)");
+	assert.match(kindCap.error, /simplification groups exceed the maximum/);
+	const withinCap = validateVerificationInput({ groups: [...kindCapRaw.keys()].slice(0, 10).map((id) => ({ primary: id })), dropped: [{ id: "R4.11", reason: "duplicate of R4.10" }] }, kindCapRaw, settings, lanes, true);
+	assert.equal(withinCap.ok, true, "10 simplification groups fit the kind cap");
+	// The kind cap rounds UP: at maxVerifications 31, ceil(31/3) = 11, so 11
+	// groups pass (a floor cap of 10 would reject them) and 12 fail — the
+	// rounding mode is part of the documented contract.
+	const cap31 = resolveDeepConfig({ maxVerifications: 31 });
+	const cap31Raw = new Map(Array.from({ length: 12 }, (_, i) => [`R4.${i + 1}`, { id: `R4.${i + 1}`, kind: "simplification", file: `f${i}.js`, line: 1, claim: "s", scenario: "preserves behavior", priority: "P3" }]));
+	const cap31Within = validateVerificationInput({ groups: [...cap31Raw.keys()].slice(0, 11).map((id) => ({ primary: id })), dropped: [{ id: "R4.12", reason: "duplicate of R4.11" }] }, cap31Raw, cap31, lanes, true);
+	assert.equal(cap31Within.ok, true, "11 simplification groups fit ceil(31/3) = 11");
+	const cap31Over = validateVerificationInput({ groups: [...cap31Raw.keys()].map((id) => ({ primary: id })), dropped: [] }, cap31Raw, cap31, lanes, true);
+	assert.equal(cap31Over.ok, false, "12 simplification groups exceed ceil(31/3) = 11");
+	assert.match(cap31Over.error, /a third of maxVerifications, rounded up/);
+
+	// Overlap hints cluster within kind only.
+	const hintFindings = new Map([
+		["R1.1", { kind: "defect", file: "a.js", line: 10 }],
+		["R4.1", { kind: "simplification", file: "a.js", line: 12 }],
+		["R1.2", { kind: "defect", file: "a.js", line: 11 }],
+	]);
+	assert.deepEqual(overlapHints(hintFindings), [["R1.1", "R1.2"]], "a simplification at a neighboring line never clusters with a defect");
+
+	// The simplifier's structured-output vocabulary is exactly the planned one.
+	assert.deepEqual([...LANE_OUTCOMES.simplifier], ["simpler", "not-simpler", "behavior-change", "unclear"]);
+	console.log("simplification pipeline: ok");
 }
 
 /** The citation gate: line-specific evidence resolves against the quote's
@@ -974,7 +1263,7 @@ async function runToolFn(toolRegistry, agent, toolName, args, signal = new Abort
 		assert.deepEqual(mixedListing.files.map((file) => file.path), ["src/a.js"], "a mixed commit keeps the real file and drops the lock");
 		// A generated-only weighty diff never trips the shard valve: whole-change roster.
 		const roster = planRoster({ files: baseListing.files, available: true, lenses: [...DEFAULTS.lenses], settings: resolveDeepConfig({}) });
-		assert.equal(roster.length, 6);
+		assert.equal(roster.length, 7);
 		assert.ok(roster.every((entry) => entry.shard === null), "a generated-only diff reviews as whole change");
 		// Folder targets keep generated paths as 0-weight entries.
 		const folderListing = await listChangedFiles({ subprocess }, root, { type: "folder", paths: ["."] }, undefined);
@@ -991,14 +1280,23 @@ async function runToolFn(toolRegistry, agent, toolName, args, signal = new Abort
 /** Lane applicability, config validation, and schemas. */
 {
 	const settings = resolveDeepConfig({});
-	assert.deepEqual(applicableLanes(settings, false).map((lane) => lane.id), ["reproducer", "skeptic", "consistency", "impact", "fix-auditor"]);
-	assert.deepEqual(applicableLanes(settings, true).map((lane) => lane.id), ["reproducer", "skeptic", "consistency", "provenance", "impact", "fix-auditor"]);
+	// The simplifier is appended LAST in the lane catalog, so every existing
+	// lane's order is preserved for both hasDiff values.
+	assert.deepEqual(applicableLanes(settings, false).map((lane) => lane.id), ["reproducer", "skeptic", "consistency", "impact", "fix-auditor", "simplifier"]);
+	assert.deepEqual(applicableLanes(settings, true).map((lane) => lane.id), ["reproducer", "skeptic", "consistency", "provenance", "impact", "fix-auditor", "simplifier"]);
 	assert.deepEqual(
 		applicableLanes(resolveDeepConfig({ lanes: { impact: { enabled: false }, "fix-auditor": { enabled: false }, consistency: { enabled: false } } }), true).map((lane) => lane.id),
-		["reproducer", "skeptic", "provenance"],
+		["reproducer", "skeptic", "provenance", "simplifier"],
 	);
 	assert.throws(() => resolveDeepConfig({ lanes: { reproducer: { enabled: false } } }), /cannot be disabled/);
+	assert.throws(() => resolveDeepConfig({ lanes: { simplifier: { enabled: false } } }), /cannot be disabled/);
 	assert.throws(() => resolveDeepConfig({ lenses: ["nope"] }), /unknown lens/);
+	// planRoster silently drops a lens with no roster class; resolveDeepConfig
+	// refuses one — and this drift detector keeps the declared lens catalog
+	// classed, so the guard can never go stale against a new lens.
+	for (const lens of LENS_IDS) {
+		assert.ok(LOCAL_LENSES.includes(lens) || CROSS_LENSES.includes(lens), `lens "${lens}" has a roster class`);
+	}
 	assert.throws(() => resolveDeepConfig({ lanes: { nope: {} } }), /unknown lane/);
 	assert.throws(() => resolveDeepConfig({ lenses: [] }), /at least one lens/);
 	// A duplicated lens would run the lens's reviewers twice: rejected, not
@@ -1126,6 +1424,12 @@ async function runToolFn(toolRegistry, agent, toolName, args, signal = new Abort
 	}
 	const fixAudit = projectForLane("fix-auditor", claims);
 	assert.deepEqual(fixAudit[0].fixes, ["CANARY-FIX"]);
+	// The simplifier audits the proposed simplification, which IS the fix: its
+	// projection carries fixes (and the scenario argument) like the fix-auditor's.
+	const simplifierProjection = projectForLane("simplifier", claims);
+	assert.deepEqual(simplifierProjection[0].fixes, ["CANARY-FIX"]);
+	assert.deepEqual(Object.keys(simplifierProjection[0]), ["file", "line", "claim", "scenario", "fixes"]);
+	assert.ok(!JSON.stringify(simplifierProjection).includes("P0"), "the simplifier never sees the reviewer priority");
 	// The seeded shuffle is deterministic per (seed, lane) and differs across
 	// lanes. Distinct claims per group make each report's owner genuinely
 	// identifiable from its text, so the refs must map back to the group the
@@ -1150,75 +1454,354 @@ async function runToolFn(toolRegistry, agent, toolName, args, signal = new Abort
 	console.log("blind projection: ok");
 }
 
-/** runAgent answers not-ok when a non-cooperative provider resolves completed
- * across the composed signal — the outer cancel or the per-run timeout — so
- * the configured limit stays hard and the caller re-runs the worker. */
+/** runAgent answers not-ok when a worker resolves completed across the composed
+ * signal — the outer cancel or the per-run timeout — so the configured limit
+ * stays hard and the caller re-runs the worker; the disposal-on-abort wiring
+ * cancels the worker either way. */
 {
-	const lateRun = (resolveIn) => ({
+	const lateRun = (resolveIn, disposed) => ({
+		childId: "child-late",
 		result: new Promise((resolve) => setTimeout(() => resolve({ stopReason: "completed", structured: { findings: [] }, output: "" }), resolveIn)),
-		dispose: async () => {},
+		dispose: async () => {
+			disposed.count += 1;
+		},
 	});
-	const lateCtx = (resolveIn) => ({
+	const lateCtx = (resolveIn, disposed) => ({
 		subagents: {
 			getProvider: () => ({
-				capabilities: { persona: true, toolFilter: true, outputSchema: true },
+				capabilities: { agentOptions: true, agentPreset: false, outputSchema: true, depthLimit: true },
 				inheritsParentContext: false,
 			}),
-			start: async () => lateRun(resolveIn),
+			startActivation: async () => lateRun(resolveIn, disposed),
 		},
+		get: () => undefined,
 		tools: { get: () => ({}) },
 	});
 	const settings = { reviewerProvider: "spawn", reviewerTools: ["bash"], reviewerTimeoutMs: 600_000 };
 
-	// The provider ignores the composed signal and resolves completed across
-	// the outer cancel: not-ok, re-run by the caller's retry.
-	const controller = new AbortController();
-	controller.abort();
-	const cancelled = await runAgent({
-		ctx: lateCtx(0),
-		settings, kind: "reviewer", label: "l", prompt: "p", persona: "x", outputSchema: {}, signal: controller.signal,
-	});
-	assert.equal(cancelled.ok, false);
-	assert.match(cancelled.reason, /was cancelled/);
+	// An already-cancelled caller signal: not-ok ("was cancelled"), re-run by
+	// the caller's retry. (An already-aborted signal fires no new listeners, so
+	// the disposal here comes from the finally.)
+	{
+		const disposed = { count: 0 };
+		const controller = new AbortController();
+		controller.abort();
+		const cancelled = await runAgent({
+			ctx: lateCtx(0, disposed),
+			settings, kind: "reviewer", label: "l", prompt: "p", persona: "x", outputSchema: {}, signal: controller.signal,
+		});
+		assert.equal(cancelled.ok, false);
+		assert.match(cancelled.reason, /was cancelled/);
+		assert.ok(disposed.count >= 1, "a cancelled worker is disposed");
+	}
 
-	// The provider resolves completed across the per-run timeout: not-ok with
-	// the timeout diagnostic — the configured limit stays hard.
-	const timedOut = await runAgent({
-		ctx: lateCtx(60),
-		settings: { ...settings, reviewerTimeoutMs: 20 }, kind: "reviewer", label: "l", prompt: "p", persona: "x", outputSchema: {}, signal: new AbortController().signal,
-	});
-	assert.equal(timedOut.ok, false);
-	assert.match(timedOut.reason, /timed out/);
+	// A cancel that lands mid-run: the abort listener disposes the worker (the
+	// manager does not watch the published signal itself), and the completed
+	// result that races the abort still answers not-ok.
+	{
+		const disposed = { count: 0 };
+		const controller = new AbortController();
+		setTimeout(() => controller.abort(), 10);
+		const cancelled = await runAgent({
+			ctx: lateCtx(60, disposed),
+			settings, kind: "reviewer", label: "l", prompt: "p", persona: "x", outputSchema: {}, signal: controller.signal,
+		});
+		assert.equal(cancelled.ok, false);
+		assert.match(cancelled.reason, /was cancelled/);
+		assert.ok(disposed.count >= 1, "a mid-run cancelled worker is disposed");
+	}
 
-	// Control: no abort, provider resolving completed → ok. (runAgent's callers
+	// The worker resolves completed across the per-run timeout: not-ok with the
+	// timeout diagnostic — the configured limit stays hard, and the deadline
+	// disposal landed (the abort listener fired before the result resolved).
+	{
+		const disposed = { count: 0 };
+		const timedOut = await runAgent({
+			ctx: lateCtx(60, disposed),
+			settings: { ...settings, reviewerTimeoutMs: 20 }, kind: "reviewer", label: "l", prompt: "p", persona: "x", outputSchema: {}, signal: new AbortController().signal,
+		});
+		assert.equal(timedOut.ok, false);
+		assert.match(timedOut.reason, /timed out/);
+		assert.ok(disposed.count >= 1, "a timed-out worker is disposed");
+	}
+
+	// Control: no abort, worker resolving completed → ok. (runAgent's callers
 	// always pass a composed signal, so the control carries a fresh one.)
-	const ok = await runAgent({
-		ctx: lateCtx(0),
-		settings, kind: "reviewer", label: "l", prompt: "p", persona: "x", outputSchema: {}, signal: new AbortController().signal,
-	});
-	assert.equal(ok.ok, true);
+	{
+		const disposed = { count: 0 };
+		const ok = await runAgent({
+			ctx: lateCtx(0, disposed),
+			settings, kind: "reviewer", label: "l", prompt: "p", persona: "x", outputSchema: {}, signal: new AbortController().signal,
+		});
+		assert.equal(ok.ok, true);
+		assert.equal(disposed.count, 1, "a settled worker is disposed exactly once");
+	}
+
+	// The stop-reason ladder: the runtime's settlement reasons in a reader's
+	// words. A bare "error" with no diagnostic and no capture is the runtime's
+	// conversion of a worker whose turn completed without the structured_output
+	// call (captureLocalResult); max-tokens and refusal name themselves; a
+	// provider error WITH a diagnostic keeps the old wording plus the
+	// diagnostic. Every result also carries the containment notes (this ctx
+	// resolves no agents registry, so the note is the unresolved-child one).
+	{
+		const ladderCtx = (outcome) => ({
+			subagents: {
+				getProvider: () => ({ capabilities: { agentOptions: true, agentPreset: false, outputSchema: true, depthLimit: true }, inheritsParentContext: false }),
+				startActivation: async () => ({ childId: "child-ladder", result: Promise.resolve(outcome), dispose: async () => {} }),
+			},
+			get: () => undefined,
+			tools: { get: () => ({}) },
+		});
+		const run = (outcome) => runAgent({
+			ctx: ladderCtx(outcome),
+			settings, kind: "reviewer", label: "l", prompt: "p", persona: "x", outputSchema: {}, signal: new AbortController().signal,
+		});
+		const noStructured = await run({ stopReason: "error", output: "a prose summary" });
+		assert.equal(noStructured.ok, false);
+		assert.match(noStructured.reason, /finished without reporting its structured result/);
+		assert.doesNotMatch(noStructured.reason, /stopped with/);
+		const maxTokens = await run({ stopReason: "max-tokens" });
+		assert.match(maxTokens.reason, /ran out of output tokens \(max-tokens\)/);
+		const refusal = await run({ stopReason: "refusal" });
+		assert.match(refusal.reason, /was blocked \(refusal\)/);
+		const diagnosed = await run({ stopReason: "error", diagnostic: "connection reset" });
+		assert.match(diagnosed.reason, /stopped with "error": connection reset/);
+		const uncontained = await run({ stopReason: "max-tokens" });
+		assert.match(uncontained.containment, /the agents registry publishes no in-process child to contain/);
+	}
 	console.log("runAgent abort: ok");
 }
 
+/** The containment install against the REAL tools service: the allow-list
+ * restricts on the child's own scope (a Service shadow keyed by the child's
+ * scope context), the guard enforces per command through the real guard
+ * waterfall, the two install independently, and every degradation returns a
+ * note instead of dying in a stdout-only warn. The live phyle run showed a
+ * deployment where neither install engaged — 18 workers, zero denials, scratch
+ * files written into the reviewed tree. */
+{
+	const { ToolRuntime } = await import("@deepseek-ai/dsh-tools");
+	const { createScope } = await import("@deepseek-ai/dsh-scope");
+	const stubDefinition = (name) => ({
+		name,
+		description: `stub ${name}`,
+		parameters: { type: "object", properties: {} },
+		execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
+		output: {
+			schema: { type: "object", properties: { ok: { type: "boolean" } }, required: [], additionalProperties: false },
+			render: () => [{ type: "text", text: "ok" }],
+		},
+	});
+	const loggerWarnings = [];
+	const logger = { warn: (error) => loggerWarnings.push(error) };
+
+	// The happy path on the real service: the restriction lands on the child's
+	// scope (a non-allow tool becomes invisible), and the guard denies through
+	// the real guardReason waterfall while read-only commands pass.
+	{
+		const ctx = new Context();
+		ctx.provide("systemPrompt", { tools() {}, section() {}, getSectionOrder: () => 0 });
+		// The ToolRuntime fiber is the ancestor the child's scope resolves the
+		// service through; the stubs register in its unscoped (global) layer, so
+		// the child's view inherits them as restrictable names — the harness's
+		// own composition shape.
+		const toolsFiber = ctx.plugin(ToolRuntime);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		for (const name of ["bash", "read", "grep", "glob", "edit"]) toolsFiber.ctx.tools.register(stubDefinition(name));
+		const childAgent = { id: "child-real" };
+		const scope = createScope(toolsFiber.ctx, childAgent);
+		childAgent.ctx = scope.ctx;
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const deps = {
+			ctx: { get: (name) => (name === "agents" ? { get: (id) => (id === childAgent.id ? childAgent : undefined) } : undefined) },
+			childId: childAgent.id,
+			allow: ["bash", "read", "grep", "glob"],
+			guardProfile: "static",
+			logger,
+		};
+		assert.deepEqual(installWorkerContainment(deps), [], "a resolvable child with a real tool view fully contains");
+		const childTools = childAgent.ctx.tools;
+		assert.equal(childTools.view(childAgent).visible.has("edit"), false, "the allow-list restricted the non-allow tool away");
+		assert.match(childTools.guardReason({ name: "bash", arguments: { command: "cat > /Users/apcamargo/Downloads/pwn.txt" }, agent: childAgent }), /deep-review worker guard/, "the installed guard denies a tree write");
+		assert.equal(childTools.guardReason({ name: "bash", arguments: { command: "git log --oneline" }, agent: childAgent }), undefined, "read-only commands pass the installed guard");
+		assert.deepEqual(loggerWarnings, [], "the happy path warns nothing");
+	}
+
+	// A restrict throw must not skip the guard: the independent installs keep
+	// the per-command enforcement and name the degradation.
+	{
+		const guards = [];
+		const child = {
+			id: "child-throws",
+			ctx: { tools: {
+				restrict() { throw new Error('tools.restrict() names unknown global tool "glob"'); },
+				guard(fn) { guards.push(fn); },
+			} },
+		};
+		const notes = installWorkerContainment({
+			ctx: { get: (name) => (name === "agents" ? { get: (id) => (id === child.id ? child : undefined) } : undefined) },
+			childId: child.id,
+			allow: ["bash", "read", "grep", "glob"],
+			guardProfile: "static",
+			logger: { warn() {} },
+		});
+		assert.match(notes[0], /the tool restriction failed: .*unknown global tool/);
+		assert.equal(guards.length, 1, "the guard still installs when restrict throws");
+		assert.match(guards[0]({ name: "bash", arguments: { command: "python3 x.py" } }), /guard/, "the installed guard still denies");
+	}
+
+	// A child whose view restricts nothing: the restriction is skipped with a
+	// note and restrict is never called, while the guard still installs.
+	{
+		let restrictCalled = false;
+		const guards = [];
+		const child = {
+			id: "child-opaque",
+			ctx: { tools: {
+				view: () => ({ restrictableNames: new Set() }),
+				restrict() { restrictCalled = true; },
+				guard(fn) { guards.push(fn); },
+			} },
+		};
+		const notes = installWorkerContainment({
+			ctx: { get: (name) => (name === "agents" ? { get: (id) => (id === child.id ? child : undefined) } : undefined) },
+			childId: child.id,
+			allow: ["bash"],
+			guardProfile: "static",
+			logger: { warn() {} },
+		});
+		assert.deepEqual(notes, ["none of the reviewer tools are restrictable on the child's tool view"]);
+		assert.equal(restrictCalled, false, "restrict is not called with an empty allow-list");
+		assert.equal(guards.length, 1, "the guard still installs when nothing is restrictable");
+	}
+
+	// An unresolvable child (a remote-provider run): one note, no throw.
+	{
+		const notes = installWorkerContainment({
+			ctx: { get: () => undefined },
+			childId: "child-remote",
+			allow: ["bash"],
+			guardProfile: "static",
+			logger: { warn() {} },
+		});
+		assert.deepEqual(notes, ["the agents registry publishes no in-process child to contain (remote providers keep none)"]);
+	}
+	console.log("worker containment: ok");
+}
+
+// The shared verify pool: one in-flight budget across both lane kinds (so the
+// verify phase holds the same number of simultaneous agents as the scan), with
+// the executing lanes' working-tree sub-cap enforced inside it.
+{
+	const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
+
+	// The total bound: 5 items over a pool of 2 never exceed 2 in flight, and
+	// the results land in input order.
+	{
+		let inFlight = 0;
+		let peak = 0;
+		const settled = await mapPoolTotal([1, 2, 3, 4, 5], (n) => `g${n}`, { total: 2 }, async (n) => {
+			inFlight++;
+			peak = Math.max(peak, inFlight);
+			await tick();
+			inFlight--;
+			return { ok: true, n };
+		});
+		assert.equal(peak, 2, `pool of 2 peaked at ${peak}`);
+		assert.deepEqual(settled.map((value) => value.n), [1, 2, 3, 4, 5]);
+	}
+
+	// The sub-cap: with `executing` capped at 1 inside a pool of 4, at most one
+	// executing item runs at once, AND the forward scan lets the static items
+	// behind a capped-out executing item start anyway (a throttled group cannot
+	// block an eligible later item) — the whole set still completes.
+	{
+		let executingInFlight = 0;
+		let executingPeak = 0;
+		let staticPeak = 0;
+		let staticInFlight = 0;
+		const items = [
+			{ kind: "executing", id: 1 }, { kind: "executing", id: 2 },
+			{ kind: "static", id: 3 }, { kind: "static", id: 4 },
+			{ kind: "executing", id: 5 }, { kind: "static", id: 6 },
+		];
+		const settled = await mapPoolTotal(items, (item) => item.kind, { total: 4, perGroup: { executing: 1 } }, async (item) => {
+			if (item.kind === "executing") {
+				executingInFlight++;
+				executingPeak = Math.max(executingPeak, executingInFlight);
+			} else {
+				staticInFlight++;
+				staticPeak = Math.max(staticPeak, staticInFlight);
+			}
+			await tick();
+			if (item.kind === "executing") executingInFlight--;
+			else staticInFlight--;
+			return { ok: true, id: item.id };
+		});
+		assert.equal(executingPeak, 1, `executing sub-cap held (peaked at ${executingPeak})`);
+		assert.ok(staticPeak > 1, `static items ran past the throttled executing group (peak ${staticPeak})`);
+		assert.deepEqual(settled.map((value) => value.id), [1, 2, 3, 4, 5, 6]);
+	}
+
+	// No starvation: every remaining item belongs to a sub-capped group — with
+	// nothing else in flight the group always has room, so the queue drains.
+	{
+		const settled = await mapPoolTotal([1, 2, 3], () => "executing", { total: 3, perGroup: { executing: 2 } }, async (n) => {
+			await tick();
+			return { ok: true, n };
+		});
+		assert.deepEqual(settled.map((value) => value.n), [1, 2, 3]);
+	}
+
+	// A throwing callback lands as a dropped {ok:false} value in its slot; the
+	// pool still settles every other item.
+	{
+		const settled = await mapPoolTotal([1, 2, 3], () => "", { total: 2 }, async (n) => {
+			if (n === 2) throw new Error("pool callback boom");
+			await tick();
+			return { ok: true, n };
+		});
+		assert.equal(settled[0].ok, true);
+		assert.equal(settled[1].ok, false);
+		assert.match(settled[1].reason, /pool callback boom/);
+		assert.equal(settled[2].ok, true);
+	}
+	console.log("shared pool: ok");
+}
+
 /** runAgent resolves the configured reviewer tools against the CALLING agent's
- * tool view (get(name, parent)) — never the host composition's global layer.
- * A web deployment registers every model-facing tool behind per-session
- * presets on the agent plane, so a no-scope lookup reads "bash" as absent and
- * every worker of a passing session fails the check below. */
+ * tool view (get(name, parent)) — never the host composition's global layer,
+ * and applies the resolved allow-list to the child's own scope (the 0.2.1
+ * replacement for the removed start-time toolFilter). A web deployment
+ * registers every model-facing tool behind per-session presets on the agent
+ * plane, so a no-scope lookup reads "bash" as absent and every worker of a
+ * passing session fails the check below. */
 {
 	const callingAgent = { id: "orchestrator" };
 	const allowLists = [];
+	const guardFns = [];
+	const childTools = {
+		restrict(filter) { allowLists.push(filter?.allow); },
+		guard(fn) { guardFns.push(fn); },
+	};
 	let resolvedScope;
 	const presetScopedToolsCtx = {
 		subagents: {
 			getProvider: () => ({
-				capabilities: { persona: true, toolFilter: true, outputSchema: true },
+				capabilities: { agentOptions: true, agentPreset: false, outputSchema: true, depthLimit: true },
 				inheritsParentContext: false,
 			}),
-			start: async (_providerName, request) => {
-				allowLists.push(request.toolFilter?.allow);
-				return { result: Promise.resolve({ stopReason: "completed", structured: { findings: [] }, output: "" }), dispose: async () => {} };
-			},
+			startActivation: async () => ({
+				childId: "child-1",
+				result: Promise.resolve({ stopReason: "completed", structured: { findings: [] }, output: "" }),
+				dispose: async () => {},
+			}),
+		},
+		// The agents registry: the fleet resolves the child here to install its
+		// containment (the activation receipt publishes no localAgent).
+		get(name) {
+			return name === "agents" ? { get: () => ({ ctx: { tools: childTools } }) } : undefined;
 		},
 		// The web-profile shape: the global layer is empty; the preset scope
 		// (an ancestor of the calling agent's scope) carries the tools.
@@ -1232,12 +1815,13 @@ async function runToolFn(toolRegistry, agent, toolName, args, signal = new Abort
 	const settings = { reviewerProvider: "spawn", reviewerTools: ["bash", "read", "grep", "glob"], reviewerTimeoutMs: 600_000 };
 
 	// The check resolves against the calling agent: the same object the callers
-	// pass as `parent`, so the preset-scope tools are visible and the worker
-	// starts with the configured allow list.
+	// pass as `parent`, so the preset-scope tools are visible and the worker's
+	// scope is restricted to the configured allow list.
 	const ok = await runAgent({ ctx: presetScopedToolsCtx, settings, kind: "reviewer", label: "l", prompt: "p", persona: "x", outputSchema: {}, parent: callingAgent, signal: new AbortController().signal });
 	assert.equal(ok.ok, true);
 	assert.deepEqual(resolvedScope, callingAgent);
 	assert.deepEqual(allowLists.at(-1), ["bash", "read", "grep", "glob"]);
+	assert.equal(guardFns.length, 1);
 
 	// A tool absent from the calling agent's view fails loud — a genuinely
 	// missing tool (not the global-layer shape) still errors with its name.
@@ -1279,7 +1863,7 @@ try {
 		// /review --deep: the orchestrator prompt carries the fleet protocol.
 		const start = await runCommandFn(commands, agent, "review", "uncommitted --deep --aggressive");
 		assert.equal(start.kind, "success");
-		assert.match(start.text, /Deep review started.*\(deep\).*fleet of up to 12 reviewers/);
+		assert.match(start.text, /Deep review started.*\(deep\).*fleet of up to 15 reviewers/);
 		assert.equal(agent.followups.length, 1);
 		const orchestratorPrompt = agent.followups[0].content[0].text;
 		assert.match(orchestratorPrompt, /deep_review_scan/);
@@ -1298,16 +1882,22 @@ try {
 		assert.ok(scan.sideEffects.length >= 1);
 		assert.match(scan.roster.find((entry) => entry.lens === "correctness").state, /succeeded/);
 
-		// Reviewer prompts carried the rubric, the lens, and the aggressive appendix.
+		// Reviewer prompts carried the persona head, the rubric, the lens, and the
+		// aggressive appendix — the persona is the fleet's own prompt prefix now
+		// (the 0.2.1 start request has no persona field).
 		const reviewerPrompt = started.find((record) => record.label.startsWith("deep review: correctness")).prompt;
+		assert.ok(reviewerPrompt.startsWith(REVIEWER_PERSONA), "the reviewer persona prefixes the prompt");
 		assert.match(reviewerPrompt, /Review Guidelines/);
 		assert.match(reviewerPrompt, /Lens: correctness/);
 		assert.match(reviewerPrompt, /Aggressive mode/);
 		assert.match(reviewerPrompt, /whole change/);
 		// Workers are fresh children of the orchestrator with restricted tools and a schema.
 		assert.equal(started[0].parent, agent);
-		assert.ok(started[0].toolFilter.allow.includes("bash"));
-		assert.ok(!started[0].toolFilter.allow.includes("edit"));
+		// The allow-list is enforced on the child's own scope (tools.restrict),
+		// one per started worker.
+		assert.equal(harness.provider.restrictions.length, started.length);
+		assert.ok(harness.provider.restrictions[0].filter.allow.includes("bash"));
+		assert.ok(!harness.provider.restrictions[0].filter.allow.includes("edit"));
 		assert.ok(started[0].outputSchema);
 		// Workers were disposed and guarded.
 		assert.ok(started.every((record) => record.disposed));
@@ -1335,7 +1925,7 @@ try {
 		assert.equal(verify.pendingRuns, 0);
 		assert.match(verify.findingsMarkdown, /## Findings \(verified by independent adversarial lanes\)/);
 		assert.match(verify.findingsMarkdown, /reproduced and traced/);
-		assert.match(verify.findingsMarkdown, /Consistency: departs from the codebase pattern/);
+		assert.match(verify.findingsMarkdown, /Consistency: departs from a codebase convention/);
 		assert.match(verify.findingsMarkdown, /- Priority assessed by the impact lane; the reviewers said P0\./);
 		assert.match(verify.findingsMarkdown, /CANARY-FIX/);
 		assert.match(verify.findingsMarkdown, /CANARY-DROP style-only/);
@@ -1372,6 +1962,306 @@ try {
 		ctx.emit("agent/turn-stopping", { agent, turn: 1, signal: new AbortController().signal });
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		assert.equal(steers.length, before);
+	}
+
+	/** The simplification pipeline end to end: the lens's findings are
+	 * kind-tagged in the scan output, normalized with their guards (an empty
+	 * scenario is dropped, a P0 clamps to P2), verified under the simplifier
+	 * lane only, and land in their own report section; a mixed-kind group is
+	 * rejected with a correctable error, and the fidelity gate requires the
+	 * section's header. */
+	{
+		const harness = await makeHarness({
+			cwd: repoRoot,
+			id: "session-simplification-0001",
+			scripts: (label, request, started) => {
+				const verifyMatch = /deep verify \[(.+?)\]/.exec(label);
+				if (verifyMatch) {
+					const lane = verifyMatch[1];
+					const refs = [...request.prompt[0].text.matchAll(/<report ref="C(\d+)">/g)].map((match) => `C${match[1]}`);
+					return {
+						stopReason: "completed",
+						structured: {
+							results: refs.map((ref) => ({
+								ref,
+								outcome: lane === "simplifier" ? "simpler" : defaultVerdicts()[lane],
+								notes: `${lane} notes`,
+								method: lane === "reproducer" ? "executed" : undefined,
+								exercisedScenario: lane === "reproducer" ? "ran" : undefined,
+								evidence: [lane, "skeptic", "consistency", "provenance", "simplifier"].includes(lane)
+									? [{ file: "src/auth.js", line: 3, quote: BUG_QUOTE }]
+									: [],
+								priority: lane === "impact" ? "P1" : undefined,
+								blastRadius: lane === "impact" ? "module" : undefined,
+								fixVerdict: lane === "fix-auditor" ? "sound" : undefined,
+							})),
+						},
+					};
+				}
+				const reviewMatch = /^deep review: (.+?)( \[shard \d+\/\d+\])?$/.exec(label);
+				if (reviewMatch?.[1] === "simplification") {
+					return {
+						stopReason: "completed",
+						structured: {
+							findings: [
+								// No behavior-preservation argument: dropped at normalization.
+								{ priority: "P3", confidence: "high", title: "Collapse the guard chain", file: "src/auth.js", line: 5, claim: "The two nested ifs collapse into one guard.", scenario: "", evidence: [] },
+								// The audited proposal.
+								{ priority: "P3", confidence: "medium", title: "Inline the one-off helper", file: "src/auth.js", line: 5, claim: "The helper wraps a single call site and adds indirection only.", scenario: "Both callers pass the same constant; the wrapper returns its argument unchanged, so inlining preserves behavior.", evidence: [{ file: "src/auth.js", line: 3, quote: BUG_QUOTE }], suggestedFix: "Inline the helper's body at its single call site and delete the wrapper." },
+							],
+							sideEffects: [],
+						},
+					};
+				}
+				return defaultScripts({})(label, request, started);
+			},
+		});
+		const { ctx, agent, commands, toolRegistry, started } = harness;
+		await runCommandFn(commands, agent, "review", "uncommitted --deep");
+		const scan = await runToolFn(toolRegistry, agent, "deep_review_scan", {});
+		assert.equal(scan.reviewersSucceeded, scan.reviewersTotal);
+		// The simplification lens ran and its surviving finding is kind-tagged;
+		// the empty-scenario finding never made it out of normalization.
+		const simplFinding = scan.findings.find((finding) => finding.kind === "simplification");
+		assert.ok(simplFinding, "the simplification finding carries the kind tag in the scan output");
+		assert.match(simplFinding.claim, /helper wraps a single call site/);
+		assert.ok(!scan.findings.some((finding) => finding.claim.includes("guard chain")), "the empty-scenario proposal was dropped");
+		// The simplification reviewer's prompt carries the lens block with the shared principles.
+		const simplPrompt = started.find((record) => record.label.startsWith("deep review: simplification")).prompt;
+		assert.match(simplPrompt, /Lens: simplification/);
+		assert.match(simplPrompt, /Maintain balance/);
+
+		// A mixed-kind consolidation is rejected with a correctable error before
+		// any verifier runs.
+		const simplId = simplFinding.id;
+		const defectId = scan.findings.find((finding) => !finding.kind)?.id;
+		await assert.rejects(
+			runToolFn(toolRegistry, agent, "deep_review_verify", { groups: [{ primary: defectId, mergedFrom: [simplId] }], dropped: [] }),
+			/never merge kinds/,
+			"the tool surfaces the correctable mixed-kind error",
+		);
+		const verify = await runToolFn(toolRegistry, agent, "deep_review_verify", {
+			groups: [{ primary: defectId }, { primary: simplId }],
+			dropped: [{ id: "R2.1", reason: "style-only" }],
+		});
+		assert.equal(verify.pendingRuns, 0);
+		// The defect finding verified under the defect lanes; the simplification
+		// verified under the simplifier lane; each landed in its own section.
+		assert.match(verify.findingsMarkdown, /## Findings \(verified by independent adversarial lanes\)/);
+		assert.match(verify.findingsMarkdown, /reproduced and traced/);
+		assert.match(verify.findingsMarkdown, /## Simplification Opportunities \(Non-Blocking\)/);
+		assert.match(verify.findingsMarkdown, /single-lane audit: no behavior change found/);
+		assert.match(verify.findingsMarkdown, /audited by the simplifier lane/);
+		assert.ok(verify.findingsMarkdown.includes(simplFinding.claim), "the confirmed simplification renders titleOf(finding)");
+		// The defect gating/corroboration/advisory lanes never ran over the
+		// simplification group, and the simplifier never ran over the defect
+		// group. (Provenance legitimately filters BOTH kinds.)
+		const verifyRuns = started.filter((record) => record.label.startsWith("deep verify"));
+		assert.ok(verifyRuns.some((record) => record.label.includes("[simplifier]")), "the simplifier lane ran");
+		for (const record of verifyRuns.filter((entry) => !entry.label.includes("[simplifier]") && !entry.label.includes("[provenance]"))) {
+			assert.ok(!record.prompt.includes("helper wraps a single call site"), `the simplification claim never reached ${record.label}`);
+		}
+		const simplifierRun = verifyRuns.find((record) => record.label.includes("[simplifier]"));
+		assert.ok(!simplifierRun.prompt.includes("returns null instead of failing fast"), "the defect claim never reached the simplifier");
+		assert.ok(simplifierRun.prompt.includes("Proposed fix:"), "the simplifier reads the proposed simplification");
+
+		// The gate: the fidelity check runs ONCE, at the first stop after the
+		// verification completed — a faithful report (both sections copied)
+		// releases without steering.
+		harness.agent.session.deriveMessages = () => [{ role: "assistant", content: [{ type: "text", text: `The report.\n\n${verify.findingsMarkdown}` }] }];
+		ctx.emit("agent/turn-stopping", { agent, turn: 1, signal: new AbortController().signal });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(harness.steers.length, 0, "a faithful report (both sections copied) releases without steering");
+		await runCommandFn(commands, agent, "end-review", "done");
+	}
+
+	/** A report that omits the simplification section costs exactly one
+	 * fidelity steer naming it — the section always renders in the verified
+	 * markdown, so its absence is detectable even when it reads "- (none)". */
+	{
+		const harness = await makeHarness({
+			cwd: repoRoot,
+			id: "session-simplification-fidelity-0001",
+			scripts: (label, request, started) => {
+				const verifyMatch = /deep verify \[(.+?)\]/.exec(label);
+				if (verifyMatch) {
+					const lane = verifyMatch[1];
+					const refs = [...request.prompt[0].text.matchAll(/<report ref="C(\d+)">/g)].map((match) => `C${match[1]}`);
+					return {
+						stopReason: "completed",
+						structured: {
+							results: refs.map((ref) => ({
+								ref,
+								outcome: lane === "simplifier" ? "not-simpler" : defaultVerdicts()[lane],
+								notes: `${lane} notes`,
+								method: lane === "reproducer" ? "executed" : undefined,
+								exercisedScenario: lane === "reproducer" ? "ran" : undefined,
+								evidence: [lane, "skeptic", "consistency", "provenance", "simplifier"].includes(lane)
+									? [{ file: "src/auth.js", line: 3, quote: BUG_QUOTE }]
+									: [],
+								priority: lane === "impact" ? "P1" : undefined,
+								blastRadius: lane === "impact" ? "module" : undefined,
+								fixVerdict: lane === "fix-auditor" ? "sound" : undefined,
+							})),
+						},
+					};
+				}
+				const reviewMatch = /^deep review: (.+?)( \[shard \d+\/\d+\])?$/.exec(label);
+				if (reviewMatch?.[1] === "simplification") {
+					return {
+						stopReason: "completed",
+						structured: {
+							findings: [
+								{ priority: "P3", confidence: "medium", title: "Inline the one-off helper", file: "src/auth.js", line: 3, claim: "The helper wraps a single call site and adds indirection only.", scenario: "The wrapper returns its argument unchanged, so inlining preserves behavior.", evidence: [{ file: "src/auth.js", line: 3, quote: BUG_QUOTE }] },
+							],
+							sideEffects: [],
+						},
+					};
+				}
+				return defaultScripts({})(label, request, started);
+			},
+		});
+		const { ctx, agent, commands, toolRegistry, steers } = harness;
+		await runCommandFn(commands, agent, "review", "uncommitted --deep");
+		// The first stop (nothing ran yet) costs one scan steer.
+		ctx.emit("agent/turn-stopping", { agent, turn: 1, signal: new AbortController().signal });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(steers.length, 1);
+		await runToolFn(toolRegistry, agent, "deep_review_scan", {});
+		await runToolFn(toolRegistry, agent, "deep_review_verify", { groups: [{ primary: "R1.1" }, { primary: "R4.1" }], dropped: [{ id: "R2.1", reason: "style-only" }] });
+		// The verification completed; the report omits the simplification
+		// section (the simplification was refuted, so the section renders
+		// "- (none)" and no title could catch its omission — only the header
+		// check does).
+		harness.agent.session.deriveMessages = () => [{ role: "assistant", content: [{ type: "text", text: "A report that omits the simplification section." }] }];
+		ctx.emit("agent/turn-stopping", { agent, turn: 2, signal: new AbortController().signal });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(steers.length, 2);
+		assert.match(steers[1].content[0].text, /Simplification Opportunities/, "the steer names the missing section");
+		await runCommandFn(commands, agent, "end-review", "done");
+	}
+
+	/** A user who pinned deep.lenses to the pre-simplification six keeps their
+	 * pinned set (README documents it): no simplification reviewer runs, and
+	 * the report must say the audit did not happen — not "- (none)" over a
+	 * description asserting the simplifier lane audited. */
+	{
+		const harness = await makeHarness({
+			cwd: repoRoot,
+			id: "session-simplification-pinned-0001",
+			deep: { lenses: ["correctness", "failure-paths", "security", "contracts", "consistency", "propagation"] },
+		});
+		const { agent, commands, toolRegistry } = harness;
+		await runCommandFn(commands, agent, "review", "uncommitted --deep");
+		const scan = await runToolFn(toolRegistry, agent, "deep_review_scan", {});
+		assert.ok(!scan.roster.some((entry) => entry.lens === "simplification"), "the pinned set runs no simplification reviewer");
+		const verify = await runToolFn(toolRegistry, agent, "deep_review_verify", { groups: [{ primary: "R1.1" }], dropped: [{ id: "R2.1", reason: "style-only" }] });
+		assert.match(verify.findingsMarkdown, /## Simplification Opportunities \(Non-Blocking\)/);
+		assert.doesNotMatch(verify.findingsMarkdown, /- \(none\)/);
+		assert.match(verify.findingsMarkdown, /- \(not evaluated — the simplification lens is not in deep\.lenses; add it to enable this audit\)/);
+		await runCommandFn(commands, agent, "end-review", "done");
+	}
+
+	/** A failed simplification reviewer above quorum must not render "- (none)":
+	 * the audit did not run, so the section discloses the failed reviewer by id
+	 * (the coverage line only counts), and the gate still releases — the
+	 * disclosure is report content, and the fidelity check requires only the
+	 * header and the confirmed titles. */
+	{
+		const harness = await makeHarness({
+			cwd: repoRoot,
+			id: "session-simplification-failed-0001",
+			scripts: (label, request, started) => {
+				if (/^deep review: simplification/.test(label)) return { stopReason: "error", diagnostic: "deterministic provider rejection" };
+				return defaultScripts({})(label, request, started);
+			},
+		});
+		const { ctx, agent, commands, toolRegistry, steers } = harness;
+		await runCommandFn(commands, agent, "review", "uncommitted --deep");
+		const scan = await runToolFn(toolRegistry, agent, "deep_review_scan", {});
+		assert.equal(scan.reviewersTotal, 7);
+		assert.equal(scan.reviewersSucceeded, 6, "the scan counts above quorum with the simplification reviewer failed");
+		assert.match(scan.roster.find((entry) => entry.lens === "simplification").state, /failed/);
+		const verify = await runToolFn(toolRegistry, agent, "deep_review_verify", { groups: [{ primary: "R1.1" }, { primary: "R2.1" }], dropped: [] });
+		assert.equal(verify.pendingRuns, 0);
+		// The section discloses the audit that never ran — never "- (none)".
+		assert.match(verify.findingsMarkdown, /- \(not evaluated — the simplification reviewer failed \(R4\); the audit did not run\. Re-run the review to retry it\)/);
+		assert.doesNotMatch(verify.findingsMarkdown, /- \(none\)/);
+		assert.match(verify.findingsMarkdown, /Coverage: 6\/7 reviewers succeeded/);
+		// A faithful report (the disclosure copied with the section) releases without steering.
+		harness.agent.session.deriveMessages = () => [{ role: "assistant", content: [{ type: "text", text: `The report.\n\n${verify.findingsMarkdown}` }] }];
+		ctx.emit("agent/turn-stopping", { agent, turn: 1, signal: new AbortController().signal });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(steers.length, 0, "the truthful disclosure releases without steering");
+		await runCommandFn(commands, agent, "end-review", "done");
+	}
+
+	/** A simplification reviewer healed by a scan re-call between a PARTIAL
+	 * verify call and the completing verify re-call must not flip the shipped
+	 * disclosure to "- (none)": the audit state is sampled once, at the first
+	 * verify call (the roster that produced the consolidation), so the healed
+	 * reviewer's unconsolidated finding can never ride under a claim that the
+	 * audit ran and found nothing. The scan re-call is sanctioned mid-verify
+	 * (both tools stay registered; the spent-scan banner invites it), and the
+	 * same-groups re-call skips revalidation, so without the snapshot the
+	 * completing call would render "- (none)" over a finding that exists in
+	 * rawFindings and appears in no group. */
+	{
+		const attempts = new Map();
+		const harness = await makeHarness({
+			cwd: repoRoot,
+			id: "session-simplification-heal-0001",
+			scripts: (label, request, started) => {
+				const attempt = (attempts.get(label) ?? 0) + 1;
+				attempts.set(label, attempt);
+				// The simplification reviewer fails both in-call attempts on scan
+				// call 1 and succeeds on the healing scan re-call.
+				if (label === "deep review: simplification") {
+					if (attempt <= 2) return { stopReason: "error", diagnostic: "deterministic provider rejection" };
+					return {
+						stopReason: "completed",
+						structured: {
+							findings: [{
+								priority: "P3", confidence: "medium", title: "Inline the one-off helper",
+								file: "src/auth.js", line: 3,
+								claim: "The helper wraps a single call site and adds indirection only.",
+								scenario: "The wrapper returns its argument unchanged, so inlining preserves behavior.",
+								evidence: [{ file: "src/auth.js", line: 3, quote: BUG_QUOTE }],
+							}],
+							sideEffects: [],
+						},
+					};
+				}
+				// The reproducer unit fails both in-call attempts on verify call 1
+				// (leaving the verification partial) and succeeds on the re-call.
+				if (/^deep verify \[reproducer\]/.test(label) && attempt <= 2) {
+					return { stopReason: "error", diagnostic: "deterministic provider rejection" };
+				}
+				return defaultScripts({})(label, request, started);
+			},
+		});
+		const { agent, commands, toolRegistry } = harness;
+		await runCommandFn(commands, agent, "review", "uncommitted --deep");
+		const scan1 = await runToolFn(toolRegistry, agent, "deep_review_scan", {});
+		assert.equal(scan1.reviewersSucceeded, 6, "scan call 1 leaves the simplification reviewer failed above quorum");
+		const verify1 = await runToolFn(toolRegistry, agent, "deep_review_verify", { groups: [{ primary: "R1.1" }, { primary: "R2.1" }], dropped: [] });
+		assert.equal(verify1.pendingRuns, 1, "verify call 1 stays partial on the failed reproducer unit");
+		const scan2 = await runToolFn(toolRegistry, agent, "deep_review_scan", {});
+		assert.equal(scan2.reviewersSucceeded, 7, "the healing scan re-call succeeds the simplification reviewer");
+		// The same-groups re-call skips revalidation even though the healed
+		// reviewer added R4.1 to rawFindings — the finding can never join this
+		// verification.
+		const verify2 = await runToolFn(toolRegistry, agent, "deep_review_verify", { groups: [{ primary: "R1.1" }, { primary: "R2.1" }], dropped: [] });
+		assert.equal(verify2.pendingRuns, 0);
+		// The shipped disclosure is the snapshot from the first verify call: the
+		// simplification reviewer was lost when the consolidation was built.
+		assert.match(verify2.findingsMarkdown, /- \(not evaluated — the simplification reviewer failed \(R4\); the audit did not run\. Re-run the review to retry it\)/);
+		assert.doesNotMatch(verify2.findingsMarkdown, /- \(none\)/);
+		assert.ok(!verify2.findingsMarkdown.includes("The helper wraps a single call site"), "the healed finding never rides under the audit-ran disclosure");
+		// The coverage line reflects the healed roster (the scan re-call recomputed
+		// it) while the disclosure stays scoped to the verification that shipped.
+		assert.match(verify2.findingsMarkdown, /Coverage: 7\/7 reviewers succeeded/);
+		await runCommandFn(commands, agent, "end-review", "done");
 	}
 
 	/** A working-tree edit between the scan and the verify surfaces at verify
@@ -1688,12 +2578,24 @@ try {
 		const scan = await runToolFn(toolRegistry, agent, "deep_review_scan", {});
 		assert.equal(scan.budgetSpent, true);
 		assert.equal(scan.reviewersSucceeded, scan.reviewersTotal - 1);
-		assert.match(scan.roster.find((entry) => entry.lens === "correctness").state, /pending|failed/);
+		// The roster entry names the budget, not a bare "was cancelled": the
+		// per-worker reason is where a reader looks for why a worker stopped.
+		const correctnessState = scan.roster.find((entry) => entry.lens === "correctness").state;
+		assert.equal(correctnessState, "failed (reviewer was cancelled when the call budget expired)", `correctness state: ${correctnessState}`);
+		assert.equal(scan.callBudgetMs, 1000);
+		// The rendered warning leads the roster and names the seconds.
+		const scanDefinition = toolRegistry.registry.registered.find((entry) => entry.name === "deep_review_scan");
+		const rendered = scanDefinition.output.render({}, scan)[0].text;
+		const warningAt = rendered.indexOf("⚠️ The call budget (1s) was spent");
+		assert.ok(warningAt >= 0, `the rendered budget warning names the seconds: ${rendered.slice(0, 160)}`);
+		assert.ok(warningAt < rendered.indexOf("## Roster"), "the budget warning precedes the roster");
+		assert.match(rendered, /Call deep_review_scan again to retry them/);
 		// A re-call re-runs only the correctness reviewer and completes.
 		const correctnessRuns = started.filter((record) => record.label.startsWith("deep review: correctness")).length;
 		const finished = await runToolFn(toolRegistry, agent, "deep_review_scan", {});
 		assert.equal(finished.reviewersSucceeded, finished.reviewersTotal);
 		assert.equal(finished.budgetSpent, false);
+		assert.ok(!scanDefinition.output.render({}, finished)[0].text.includes("⚠️ The call budget"), "a fresh-budget re-call renders no budget warning");
 		const correctnessAfter = started.filter((record) => record.label.startsWith("deep review: correctness")).length;
 		assert.equal(correctnessAfter, correctnessRuns + 1);
 	}
@@ -1708,16 +2610,17 @@ try {
 			id: "session-verify-budget-0001",
 			deep: { callBudgetMs: 1000 },
 			scripts: (() => {
-				// The first verify call starts exactly 4 children (1 executing + 3
-				// static in flight at verifierConcurrency 3; 2 static units queue
-				// behind the pool limit and start in the re-call). Sleep for the
-				// first 4 verify occurrences — the first verify call — and make
-				// every later occurrence instant.
+				// The first verify call starts exactly 3 children — the shared pool
+				// runs at deep.concurrency 3 across both lane kinds, so the first
+				// three units in roster order (the reproducer, then the first two
+				// static lanes) take the whole pool and the other three units queue
+				// for the re-call. Sleep for the first 3 verify occurrences — the
+				// first verify call — and make every later occurrence instant.
 				let verifyOccurrences = 0;
 				return (label, request, started) => {
 					if (/deep verify \[/.test(label)) {
 						verifyOccurrences += 1;
-						if (verifyOccurrences <= 4) return new Promise((resolve) => setTimeout(() => resolve({ stopReason: "completed", structured: { results: [] } }), 2000));
+						if (verifyOccurrences <= 3) return new Promise((resolve) => setTimeout(() => resolve({ stopReason: "completed", structured: { results: [] } }), 2000));
 					}
 					return defaultScripts({})(label, request, started);
 				};
@@ -1731,15 +2634,49 @@ try {
 		// spent call with `GitError "git ls-files -m: cancelled"`.
 		assert.equal(verify.budgetSpent, true);
 		assert.ok(verify.pendingRuns > 0, `pendingRuns: ${verify.pendingRuns}`);
+		assert.equal(verify.callBudgetMs, 1000);
 		assert.match(verify.findingsMarkdown, /## Withheld \(raised but unverified\)/);
+		// The rendered markdown names the unfinished runs and the re-call: the
+		// structured pendingRuns/budgetSpent fields never reach the orchestrator.
+		assert.match(verify.findingsMarkdown, /\d+ verifier run\(s\) did not finish \(the 1s call budget was spent mid-verification\)/);
+		assert.match(verify.findingsMarkdown, /call deep_review_verify again with the same groups and dropped findings/);
 		// A re-call with the same args creates a fresh budget and completes.
 		const verify2 = await runToolFn(toolRegistry, agent, "deep_review_verify", { groups: [{ primary: "R1.1" }], dropped: [{ id: "R2.1", reason: "style-only" }] });
 		assert.equal(verify2.pendingRuns, 0);
 		assert.equal(verify2.budgetSpent, false);
 		assert.ok(verify2.findingsMarkdown.includes("reproduced and traced"));
+		assert.ok(!verify2.findingsMarkdown.includes("verifier run(s) did not finish"), "a completed verification renders no pending note");
 		// A spent call never rejected: nothing extra was spawned by the first call's snapshot.
 		const scanStarted = started.filter((record) => !/deep verify \[/.test(record.label)).length;
 		assert.ok(scanStarted <= 7, `scan children: ${scanStarted}`);
+	}
+
+	// The containment-warning surface, end to end: children with no tools
+	// service degrade every worker, and the degradation surfaces in the scan
+	// value, the rendered scan text, and the verify markdown — never as a
+	// stdout-only warn.
+	{
+		const harness = await makeHarness({
+			cwd: repoRoot,
+			id: "session-containment-0001",
+			childTools: false,
+		});
+		const { agent, commands, toolRegistry } = harness;
+		await runCommandFn(commands, agent, "review", "uncommitted --deep");
+		const scan = await runToolFn(toolRegistry, agent, "deep_review_scan", {});
+		assert.match(scan.containmentWarning, /\d+ fleet worker\(s\) ran without full tool containment/);
+		assert.match(scan.containmentWarning, /no tools service to restrict; the child's tools service exposes no guard hook/, "one distinct note for a uniform degradation");
+		const scanDefinition = toolRegistry.registry.registered.find((entry) => entry.name === "deep_review_scan");
+		assert.match(scanDefinition.output.render({}, scan)[0].text, /⚠️ \d+ fleet worker\(s\) ran without full tool containment/);
+		const verify = await runToolFn(toolRegistry, agent, "deep_review_verify", { groups: [{ primary: "R1.1" }], dropped: [{ id: "R2.1", reason: "style-only" }] });
+		assert.match(verify.containmentWarning, /ran without full tool containment/);
+		assert.match(verify.findingsMarkdown, /> ⚠️ \d+ fleet worker\(s\) ran without full tool containment/);
+		// A clean deployment renders no containment line at all.
+		const cleanHarness = await makeHarness({ cwd: repoRoot, id: "session-containment-clean-0001" });
+		await runCommandFn(cleanHarness.commands, cleanHarness.agent, "review", "uncommitted --deep");
+		const cleanScan = await runToolFn(cleanHarness.toolRegistry, cleanHarness.agent, "deep_review_scan", {});
+		assert.equal(cleanScan.containmentWarning, undefined, "fully contained workers carry no warning");
+		assert.ok(!cleanScan.roster.some((entry) => entry.state.includes("containment")));
 	}
 
 	/** A spent budget below quorum returns the structured value (never the
@@ -1748,7 +2685,10 @@ try {
 		const harness = await makeHarness({
 			cwd: repoRoot,
 			id: "session-budget-quorum-0001",
-			deep: { concurrency: 6, callBudgetMs: 1000 },
+			// Concurrency 7 = the full roster: every reviewer's first (sleeping)
+			// start lands inside the spent call, so the fresh-budget re-call
+			// retries only second starts and completes.
+			deep: { concurrency: 7, callBudgetMs: 1000 },
 			scripts: ((seenLabels) => (label, request, started) => {
 				// Every reviewer sleeps past the budget on its FIRST start only.
 				if (!seenLabels.has(label)) {
@@ -1793,8 +2733,8 @@ try {
 		const { ctx, agent, commands, toolRegistry, steers, started } = harness;
 		await runCommandFn(commands, agent, "review", "uncommitted --deep");
 		const scan = await runToolFn(toolRegistry, agent, "deep_review_scan", {});
-		assert.equal(scan.reviewersTotal, 6);
-		assert.equal(scan.reviewersSucceeded, 5);
+		assert.equal(scan.reviewersTotal, 7);
+		assert.equal(scan.reviewersSucceeded, 6);
 		assert.match(scan.roster.find((entry) => entry.lens === "failure-paths").state, /failed/);
 		// The in-call retry re-spawned the doomed worker once before the failure
 		// was declared: the retry also fails, and the entry stays failed.
@@ -1813,8 +2753,8 @@ try {
 		assert.equal(verify.pendingRuns, 0);
 		assert.match(verify.findingsMarkdown, /reproduced and traced/);
 		// The coverage line treats the failed reviewers' scopes as uncovered.
-		assert.match(verify.findingsMarkdown, /Coverage: 5\/6 reviewers succeeded/);
-		harness.agent.session.deriveMessages = () => [{ role: "assistant", content: [{ type: "text", text: `The report.\n\nThe new auth path returns null instead of failing fast.` }] }];
+		assert.match(verify.findingsMarkdown, /Coverage: 6\/7 reviewers succeeded/);
+		harness.agent.session.deriveMessages = () => [{ role: "assistant", content: [{ type: "text", text: `The report.\n\n## Simplification Opportunities (Non-Blocking)\n- (none)\n\nThe new auth path returns null instead of failing fast.` }] }];
 		ctx.emit("agent/turn-stopping", { agent, turn: 3, signal: new AbortController().signal });
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		assert.equal(steers.length, 2, "the counted scan + completed verification release without steering");
@@ -1896,7 +2836,7 @@ try {
 		await runToolFn(toolRegistry, agent, "deep_review_scan", {});
 		await runToolFn(toolRegistry, agent, "deep_review_verify", { groups: [{ primary: "R1.1" }], dropped: [{ id: "R2.1", reason: "style-only" }] });
 		// The pipeline completed: the third stop releases WITHOUT the incomplete marker.
-		harness.agent.session.deriveMessages = () => [{ role: "assistant", content: [{ type: "text", text: `The report.\n\nThe new auth path returns null instead of failing fast.` }] }];
+		harness.agent.session.deriveMessages = () => [{ role: "assistant", content: [{ type: "text", text: `The report.\n\n## Simplification Opportunities (Non-Blocking)\n- (none)\n\nThe new auth path returns null instead of failing fast.` }] }];
 		ctx.emit("agent/turn-stopping", { agent, turn: 3, signal: new AbortController().signal });
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		assert.equal(steers.length, 2, "the completed pipeline releases without steering");
@@ -2298,7 +3238,7 @@ try {
 	/** Unload with an in-flight scan: abort, drain, dispose scopes, close the domain. */
 	{
 		const timeline = [];
-		const { provider, started } = makeProvider({
+		const { provider, started, children } = makeProvider({
 			scripts: () => new Promise((resolve) => setTimeout(() => resolve({ stopReason: "completed", structured: { findings: [], sideEffects: [] } }), 300)),
 		});
 		const toolRegistry = makeToolRegistry();
@@ -2309,7 +3249,8 @@ try {
 		host.provide("storageDomain", { async open() { return { name: "review", close: async () => void timeline.push("domain closed"), table: () => table }; } });
 		host.provide("commands", commands);
 		host.provide("tools", toolRegistry);
-		host.provide("subagents", { getProvider: () => provider, start: (name_, request) => provider.start(request) });
+		host.provide("agents", { get: (id) => children.get(id) });
+		host.provide("subagents", { getProvider: () => provider, startActivation: (spec) => provider.startActivation(spec) });
 		const agent = {
 			id: "session-unload-0001",
 			session: { header: { cwd: repoRoot }, deriveMessages: () => [] },

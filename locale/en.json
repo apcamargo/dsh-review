@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Code Review",
-    "description": "Review uncommitted changes, branches, commits, pull requests, or folders with prioritized findings; --deep runs a reviewer fleet with independent adversarial verification."
+    "description": "Review uncommitted changes, branches, commits, pull requests, or folders with prioritized findings and simplification opportunities; --deep runs a reviewer fleet with independent adversarial verification."
   }
 }

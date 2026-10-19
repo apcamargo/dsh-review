@@ -46,15 +46,14 @@ export interface DeepConfig {
 	reviewerAgentOptions?: DeepAgentOptions | undefined;
 	/** Agent options for every verifier lane, over the orchestrator's. */
 	verifierAgentOptions?: DeepAgentOptions | undefined;
-	/** Reviewer lenses to run; `performance` is opt-in. */
+	/** Reviewer lenses to run; `simplification` is on by default and `performance` is opt-in. An explicitly configured list keeps its pinned set. */
 	lenses?: string[] | undefined;
 	/** Tools the workers may use; checked against the orchestrator's tools. */
 	reviewerTools?: string[] | undefined;
 	maxReviewers?: number | undefined;
 	shardThresholdLines?: number | undefined;
+	/** Fleet workers running at once — the scan's reviewers and the verify phase's verifier lanes share this one pool size; at most 2 reproducer lanes run concurrently inside the verify pool. */
 	concurrency?: number | undefined;
-	verifierConcurrency?: number | undefined;
-	executingConcurrency?: number | undefined;
 	reviewerTimeoutMs?: number | undefined;
 	verifierTimeoutMs?: number | undefined;
 	callBudgetMs?: number | undefined;
